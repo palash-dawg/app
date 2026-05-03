@@ -4,6 +4,10 @@ from supabase import create_client
 from PIL import Image
 import io
 from datetime import datetime, timedelta
+import gspread
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from google.oauth2.service_account import Credentials
 
 # --- 1. BRANDING & DB CONFIG ---
 st.set_page_config(page_title="KBP ENERGY PVT LTD - Site OS", layout="wide", page_icon="⚡")
@@ -14,13 +18,56 @@ def init_db():
 
 db = init_db()
 
-# --- 2. SPEED BOOST: SMART CACHING ---
-@st.cache_data(ttl=600) # Cache data for 10 minutes to stop lag
+# --- 2. GOOGLE BACKUP SYSTEM ---
+def init_google():
+    """Initializes Google Credentials for Drive and Sheets."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    # Convert Streamlit TOML secrets back to dictionary format
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    return Credentials.from_service_account_info(creds_dict, scopes=scopes)
+
+def sync_to_sheets(row_data):
+    """Appends a new worker row to the Google Sheet live backup."""
+    try:
+        creds = init_google()
+        client = gspread.authorize(creds)
+        sheet = client.open("KBP_WORKFORCE_BACKUP").sheet1
+        
+        # Add timestamp to the row
+        row_data.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        sheet.append_row(row_data)
+        st.toast("⚡ Backed up to Google Sheets")
+    except Exception as e:
+        st.warning(f"Google Sheets backup skipped/failed: Check if sheet is named 'KBP_WORKFORCE_BACKUP' and shared. Error: {e}")
+
+def upload_csv_to_drive(df):
+    """Uploads the full Master Data CSV to Google Drive."""
+    try:
+        creds = init_google()
+        service = build('drive', 'v3', credentials=creds)
+        
+        csv_buffer = io.BytesIO()
+        df.to_csv(csv_buffer, index=False)
+        csv_buffer.seek(0)
+        
+        file_metadata = {
+            'name': f'KBP_Backup_{datetime.now().strftime("%Y-%m-%d_%H-%M")}.csv',
+            'parents': [st.secrets["google_drive"]["folder_id"]]
+        }
+        media = MediaIoBaseUpload(csv_buffer, mimetype='text/csv')
+        service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        st.success("✅ Master Archive Saved to Google Drive Successfully!")
+    except Exception as e:
+        st.error(f"Google Drive Backup Failed: {e}")
+
+# --- 3. DATA ENGINE ---
+@st.cache_data(ttl=600)
 def get_master_data():
-    """Fetches staff and calculates serial Emp IDs and Payouts using vectorized math."""
     res = db.table("staff_master").select("*, attendance(status, date), advances(amount)").order("created_at").execute()
     
-    # Empty Database Shield (Prevents KeyError)
     if not res.data:
         return pd.DataFrame(columns=[
             'id', 'Emp ID', 'name', 'father_name', 'dob', 'mobile_no', 
@@ -31,11 +78,9 @@ def get_master_data():
     df = pd.DataFrame(res.data)
     
     if not df.empty:
-        # Sequential Shuffle Logic
         df = df.sort_values(by="created_at").reset_index(drop=True)
         df.insert(0, 'Emp ID', range(1, len(df) + 1))
         
-        # High-Speed Vectorized Payroll Math
         def fast_calc(row):
             att = row.get('attendance') or []
             presents = sum(1 for x in att if x and x.get('status') == 'Present')
@@ -46,7 +91,7 @@ def get_master_data():
         df['Net Payout'] = df.apply(fast_calc, axis=1)
     return df
 
-# --- 3. UTILITY: COMPRESSOR ---
+# --- 4. UTILITY COMPRESSOR ---
 def compress_photo(uploaded_file):
     img = Image.open(uploaded_file).convert("RGB")
     quality, img_io = 80, io.BytesIO()
@@ -78,7 +123,7 @@ page = st.sidebar.radio("Navigation", ["Worker Management", "Attendance Log", "A
 if st.sidebar.button("Logout"):
     del st.session_state["user_role"]; st.cache_data.clear(); st.rerun()
 
-# --- PAGE: WORKER MANAGEMENT (PAGINATED FOR SPEED + SUMMARY CARD) ---
+# --- PAGE: WORKER MANAGEMENT ---
 if page == "Worker Management":
     st.header("📝 Registration & Directory")
     
@@ -94,7 +139,8 @@ if page == "Worker Management":
                 wage = c2.number_input("Daily Wage (₹)", value=500)
                 photo = st.file_uploader("Upload ID Photo", type=['jpg','png'])
 
-                if st.form_submit_button("Register"):
+                if st.form_submit_button("Register Worker"):
+                    # 1. Supabase Logic
                     img_url = ""
                     if photo:
                         img_bytes = compress_photo(photo)
@@ -102,16 +148,23 @@ if page == "Worker Management":
                         db.storage.from_("staff_files").upload(path, img_bytes, {"content-type": "image/jpeg"})
                         img_url = db.storage.from_("staff_files").get_public_url(path)
                     
-                    db.table("staff_master").insert({"name": name, "father_name": father, "dob": str(dob), "mobile_no": mobile, "aadhar_no": aadhar, "account_no": acc, "ifsc": ifsc, "daily_wage": wage, "photo_url": img_url, "department": role}).execute()
-                    st.cache_data.clear(); st.success("Registered!"); st.rerun()
+                    try:
+                        db.table("staff_master").insert({"name": name, "father_name": father, "dob": str(dob), "mobile_no": mobile, "aadhar_no": aadhar, "account_no": acc, "ifsc": ifsc, "daily_wage": wage, "photo_url": img_url, "department": role}).execute()
+                        st.success("Registered in System!")
+                        
+                        # 2. Google Sheets Backup Logic
+                        sync_to_sheets([name, father, str(dob), mobile, aadhar, acc, ifsc, wage])
+                        
+                    except Exception as e:
+                        st.error(f"Error registering worker: {e}")
+                        
+                    st.cache_data.clear(); st.rerun()
 
-    # SPEED BOOST: PAGINATION
     df = get_master_data()
     if not df.empty:
         active_df = df[df['leave_date'].isna()].copy()
         st.subheader(f"📋 Active Directory ({len(active_df)} workers)")
         
-        # Pagination Logic: 20 per page
         items_per_page = 20
         total_pages = max(1, (len(active_df) + items_per_page - 1) // items_per_page)
         curr_page = st.number_input("Page", min_value=1, max_value=total_pages, step=1)
@@ -119,9 +172,7 @@ if page == "Worker Management":
         end_idx = start_idx + items_per_page
         
         page_data = active_df.iloc[start_idx:end_idx]
-        
-        curr_month = datetime.now().month
-        curr_year = datetime.now().year
+        curr_month, curr_year = datetime.now().month, datetime.now().year
 
         for _, row in page_data.iterrows():
             with st.container():
@@ -135,32 +186,19 @@ if page == "Worker Management":
                     db.table("staff_master").delete().eq("id", row['id']).execute()
                     st.cache_data.clear(); st.rerun()
 
-                # --- SUMMARY CARD FOR ADMIN ---
                 if role == "Admin" or role == "Finance":
                     with st.expander(f"📊 Financial Summary: {row['name']}"):
-                        # Calculate Present This Month
                         att_list = row.get('attendance') or []
-                        presents_month = sum(
-                            1 for a in att_list 
-                            if a and a.get('status') == 'Present' 
-                            and datetime.strptime(a.get('date'), '%Y-%m-%d').month == curr_month 
-                            and datetime.strptime(a.get('date'), '%Y-%m-%d').year == curr_year
-                        )
+                        presents_month = sum(1 for a in att_list if a and a.get('status') == 'Present' and datetime.strptime(a.get('date'), '%Y-%m-%d').month == curr_month and datetime.strptime(a.get('date'), '%Y-%m-%d').year == curr_year)
+                        total_adv = sum(a.get('amount', 0) for a in (row.get('advances') or []))
                         
-                        # Calculate Total Advances
-                        adv_list = row.get('advances') or []
-                        total_adv = sum(a.get('amount', 0) for a in adv_list)
-
-                        # Display Dashboard Metrics
                         sc1, sc2, sc3 = st.columns(3)
                         sc1.metric("Present (This Month)", presents_month)
                         sc2.metric("Total Advances", f"₹{total_adv}")
                         sc3.metric("Net Balance Payout", f"₹{row.get('Net Payout', 0)}")
-                st.divider() # Clean horizontal line between workers
-    else:
-        st.warning("No workers registered yet.")
+                st.divider()
 
-# --- PAGE: ATTENDANCE LOG (MARK ALL EXCEPT) ---
+# --- PAGE: ATTENDANCE LOG ---
 elif page == "Attendance Log":
     st.header("📅 Daily Log")
     df = get_master_data()
@@ -191,14 +229,13 @@ elif page == "Attendance Log":
     else:
         st.warning("No workers registered yet.")
 
-# --- PAGE: ATTENDANCE REPORTS (TEAM SUMMARY) ---
+# --- PAGE: ATTENDANCE REPORTS ---
 elif page == "Attendance Reports":
     st.header("📊 Reporting")
     df = get_master_data()
     
     if not df.empty:
         tab1, tab2 = st.tabs(["👤 Individual Audit", "👥 Team Summary"])
-        
         with tab1:
             worker = st.selectbox("Search Worker", df['name'].tolist())
             w_id = df[df['name'] == worker]['id'].values[0]
@@ -211,7 +248,6 @@ elif page == "Attendance Reports":
         with tab2:
             period = st.radio("Period:", ["30 Days", "90 Days", "Full Year"], horizontal=True)
             days = 30 if "30" in period else (90 if "90" in period else 365)
-            st.write(f"Showing performance summary for last {days} days.")
             
             summary_list = []
             cutoff = (datetime.now() - timedelta(days=days)).date()
@@ -221,21 +257,26 @@ elif page == "Attendance Reports":
                 a = sum(1 for x in att if x['status'] == 'Absent')
                 summary_list.append({"Emp ID": row['Emp ID'], "Name": row['name'], "Presents": p, "Absents": a, "Rate": f"{round((p/(p+a))*100,1)}%" if (p+a)>0 else "0%"})
             
-            summary_df = pd.DataFrame(summary_list)
-            st.dataframe(summary_df, use_container_width=True)
-            st.download_button("📥 Export Report", summary_df.to_csv(index=False), f"Summary_{period}.csv")
-    else:
-        st.warning("No workers registered yet.")
+            st.dataframe(pd.DataFrame(summary_list), use_container_width=True)
 
-# --- PAGE: EXPORT CENTER ---
+# --- PAGE: EXPORT CENTER (WITH GOOGLE DRIVE PUSH) ---
 elif page == "Export Center":
-    st.header("📥 Exports")
+    st.header("📥 Exports & Backups")
     df = get_master_data()
+    
     if not df.empty:
         c1, c2 = st.columns(2)
         if role == "Admin" or role == "HR":
             c1.download_button("📥 Export HR (With Leave Date)", df[['Emp ID','name','mobile_no','dob','leave_date','aadhar_no']].to_csv(index=False), "HR_Master.csv")
         if role == "Admin" or role == "Finance":
             c2.download_button("📥 Export Finance (Bank File)", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Payouts.csv")
+            
+        if role == "Admin":
+            st.divider()
+            st.subheader("☁️ Cloud Backup")
+            st.info("Push a complete snapshot of all site data to Google Drive.")
+            if st.button("🚀 Backup Full Master to Google Drive"):
+                with st.spinner("Pushing to Vault..."):
+                    upload_csv_to_drive(df)
     else:
         st.warning("No data available to export.")
