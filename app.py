@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
-from supabase import create_client, Client
+from supabase import create_client
 from PIL import Image
 import io
 from datetime import datetime
 
-# --- CONFIG & DB CONNECTION ---
-st.set_page_config(page_title="Workforce OS Pro", layout="wide")
+# --- CONFIG ---
+st.set_page_config(page_title="Site Workforce OS", layout="wide")
 
 @st.cache_resource
 def init_db():
@@ -14,164 +14,154 @@ def init_db():
 
 db = init_db()
 
-# --- IMAGE COMPRESSOR (STRICT < 100KB) ---
-def compress_image(uploaded_file):
-    img = Image.open(uploaded_file)
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    
-    quality = 90
-    output = io.BytesIO()
+# --- MODULE: 100KB IMAGE COMPRESSOR ---
+def compress_site_photo(uploaded_file):
+    img = Image.open(uploaded_file).convert("RGB")
+    quality = 80
+    img_io = io.BytesIO()
     
     while True:
-        output.seek(0)
-        output.truncate(0)
-        img.save(output, format="JPEG", quality=quality)
-        size_kb = output.tell() / 1024
+        img_io.seek(0)
+        img_io.truncate(0)
+        img.save(img_io, format="JPEG", quality=quality, optimize=True)
+        size_kb = img_io.tell() / 1024
         
-        if size_kb <= 100 or quality <= 10:
+        if size_kb <= 100 or quality <= 5:
             break
-        quality -= 10
-        if quality < 50:
+        quality -= 5
+        if quality < 30: # Shrink dimensions if quality reduction isn't enough
             img = img.resize((int(img.width * 0.9), int(img.height * 0.9)))
             
-    output.seek(0)
-    return output.getvalue(), size_kb
+    return img_io.getvalue(), size_kb
 
-# --- 🔐 ROLE-BASED LOGIN SYSTEM ---
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-    st.session_state.role = None
-
-def login():
-    st.title("🔐 Workforce OS Login")
-    with st.form("login_form"):
-        user = st.text_input("Username")
-        pwd = st.text_input("Password", type="password")
-        submit = st.form_submit_button("Login")
-        
-        if submit:
+# --- MODULE: LOGIN & ROLE CHECK ---
+if "user_role" not in st.session_state:
+    st.title("🚧 Construction Site Portal")
+    with st.form("login"):
+        u = st.text_input("Username").lower()
+        p = st.text_input("Password", type="password")
+        if st.form_submit_button("Log In"):
             creds = st.secrets["CREDENTIALS"]
-            if user in creds and creds[user] == pwd:
-                st.session_state.authenticated = True
-                # Assign roles based on username
-                if "admin" in user.lower(): st.session_state.role = "Admin"
-                elif "hr" in user.lower(): st.session_state.role = "HR"
-                elif "finance" in user.lower(): st.session_state.role = "Finance"
+            if u in creds and creds[u] == p:
+                if "admin" in u: st.session_state.user_role = "Admin"
+                elif "hr" in u: st.session_state.user_role = "HR"
+                elif "fin" in u: st.session_state.user_role = "Finance"
                 st.rerun()
-            else:
-                st.error("Invalid Username or Password")
-
-if not st.session_state.authenticated:
-    login()
+            else: st.error("Wrong Username or Password")
     st.stop()
 
-# --- SIDEBAR: ROLE-BASED NAVIGATION ---
-st.sidebar.title(f"👤 {st.session_state.role} Portal")
+role = st.session_state.user_role
+st.sidebar.title(f"Role: {role}")
+page = st.sidebar.radio("Navigation", ["Dashboard", "Worker Registration", "Attendance", "Financials & Payouts"])
 
-# Logic: Admins see all, others are locked to their role
-if st.session_state.role == "Admin":
-    active_dept = st.sidebar.radio("SELECT DEPARTMENT", ["Admin", "HR", "Finance"])
-else:
-    active_dept = st.session_state.role
-    st.sidebar.info(f"Department Locked: **{active_dept}**")
-
-st.sidebar.divider()
-
-menu = st.sidebar.radio(f"🛠️ {active_dept} Menu", 
-                        ["Dashboard", "Enrollment", "Attendance", "Payroll", "Records"])
-
-if st.sidebar.button("Log Out"):
-    st.session_state.authenticated = False
+if st.sidebar.button("Logout"):
+    del st.session_state["user_role"]
     st.rerun()
 
-# --- 1. DASHBOARD ---
-if menu == "Dashboard":
-    st.title(f"💼 {active_dept} Dashboard")
-    res = db.table("staff_master").select("id").eq("department", active_dept).execute()
-    st.metric(f"Total {active_dept} Staff", len(res.data))
-    st.write(f"Logged in as: **{st.session_state.role}**")
+# --- PAGE: DASHBOARD ---
+if page == "Dashboard":
+    st.title(f"📈 Site Overview - {role}")
+    res = db.table("staff_master").select("id").execute()
+    st.metric("Total Workers on Site", len(res.data))
+    st.info(f"Logged in as {role}. Data access is restricted to your permissions.")
 
-# --- 2. ENROLLMENT (With Compressor) ---
-elif menu == "Enrollment":
-    st.title(f"📝 {active_dept} Enrollment")
-    with st.form("enroll_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        name = col1.text_input("Full Name*")
-        father = col2.text_input("Father's Name")
-        dob = col1.date_input("Date of Birth", min_value=datetime(1960,1,1))
-        aadhar = col2.text_input("Aadhar Number*")
-        
-        st.divider()
-        b1, b2, b3 = st.columns(3)
-        bank = b1.text_input("Bank Name")
-        acc = b2.text_input("Account Number")
-        ifsc = b3.text_input("IFSC Code")
-        wage = st.number_input("Daily Wage (₹)", value=500)
-        
-        photo = st.file_uploader("Upload ID Photo (<100KB Auto-Compress)", type=['jpg', 'png'])
-        
-        if st.form_submit_button("Save Record"):
-            if not name or not aadhar:
-                st.error("Missing required fields!")
-            else:
-                photo_url = ""
-                if photo:
-                    compressed_data, size = compress_image(photo)
-                    path = f"{active_dept}/{aadhar}.jpg"
-                    db.storage.from_("staff_files").upload(path, compressed_data, {"content-type": "image/jpeg"})
-                    photo_url = db.storage.from_("staff_files").get_public_url(path)
-                
-                db.table("staff_master").insert({
-                    "name": name, "father_name": father, "dob": str(dob), "aadhar_no": aadhar,
-                    "department": active_dept, "bank_name": bank, "account_no": acc,
-                    "ifsc": ifsc, "daily_wage": wage, "photo_url": photo_url
-                }).execute()
-                st.success(f"Registered {name} in {active_dept}!")
+# --- PAGE: WORKER REGISTRATION (HR & ADMIN ONLY) ---
+elif page == "Worker Registration":
+    if role == "Finance":
+        st.error("Finance role does not have permission to register workers.")
+    else:
+        st.title("📝 New Worker Registration")
+        with st.form("reg_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Worker Full Name*")
+            father = c2.text_input("Father's Name")
+            dob = c1.date_input("Date of Birth", min_value=datetime(1960,1,1))
+            aadhar = c2.text_input("Aadhar Number*")
+            
+            # Admin can see bank fields during reg, HR might not depending on your choice
+            # Here we include it for convenience but mask it later
+            st.divider()
+            b1, b2, b3 = st.columns(3)
+            bank = b1.text_input("Bank Name")
+            acc = b2.text_input("Account Number")
+            ifsc = b3.text_input("IFSC")
+            wage = st.number_input("Daily Wage (₹)", value=500)
+            
+            photo = st.file_uploader("Worker ID Photo (Auto-Compress <100KB)", type=['jpg','png','jpeg'])
+            
+            if st.form_submit_button("Save to Site Database"):
+                if not name or not aadhar:
+                    st.error("Missing mandatory fields!")
+                else:
+                    url = ""
+                    if photo:
+                        img_bytes, kb = compress_site_photo(photo)
+                        path = f"site_ids/{aadhar}.jpg"
+                        db.storage.from_("staff_files").upload(path, img_bytes, {"content-type": "image/jpeg"})
+                        url = db.storage.from_("staff_files").get_public_url(path)
+                    
+                    db.table("staff_master").insert({
+                        "name": name, "father_name": father, "dob": str(dob), "aadhar_no": aadhar,
+                        "bank_name": bank, "account_no": acc, "ifsc": ifsc, 
+                        "daily_wage": wage, "photo_url": url, "department": "General"
+                    }).execute()
+                    st.success(f"Worker {name} Registered!")
 
-# --- 3. ATTENDANCE ---
-elif menu == "Attendance":
-    st.title(f"📅 Attendance: {active_dept}")
-    res = db.table("staff_master").select("id, name").eq("department", active_dept).execute()
-    df = pd.DataFrame(res.data)
+# --- PAGE: ATTENDANCE (EVERYONE) ---
+elif page == "Attendance":
+    st.title("📅 Daily Attendance Log")
+    workers = db.table("staff_master").select("id, name").execute()
+    df = pd.DataFrame(workers.data)
     
     if not df.empty:
         df['Status'] = "Present"
         edited = st.data_editor(df, use_container_width=True, hide_index=True)
-        if st.button("Sync to Cloud"):
-            batch = [{"staff_id": r['id'], "date": str(datetime.now().date()), "status": r['Status']} for _, r in edited.iterrows()]
-            db.table("attendance").upsert(batch).execute()
-            st.success("Attendance Updated!")
+        if st.button("Save Log"):
+            log = [{"staff_id": r['id'], "date": str(datetime.now().date()), "status": r['Status']} for _, r in edited.iterrows()]
+            db.table("attendance").upsert(log).execute()
+            st.success("Attendance Synced.")
+    else: st.warning("No workers found. Register them first.")
 
-# --- 4. PAYROLL (The Math) ---
-elif menu == "Payroll":
-    st.title(f"💰 {active_dept} Payroll")
-    res = db.table("staff_master").select("*, attendance(status), advances(amount)").eq("department", active_dept).execute()
+# --- PAGE: FINANCIALS & PAYOUTS (FINANCE & ADMIN FOCUS) ---
+elif page == "Financials & Payouts":
+    st.title("💰 Financial Records & Exports")
     
-    pay_data = []
-    for r in res.data:
-        presents = sum(1 for a in r['attendance'] if a['status'] == 'Present')
-        halfs = sum(1 for a in r['attendance'] if a['status'] == 'Half-Day')
-        advs = sum(adv['amount'] for adv in r['advances'])
+    # 1. PERMISSION FILTERING
+    if role == "HR":
+        # HR only sees personal details for the export
+        res = db.table("staff_master").select("name, father_name, dob, aadhar_no").execute()
+        df_display = pd.DataFrame(res.data)
+        st.subheader("Worker Directory (HR View)")
+        st.dataframe(df_display, use_container_width=True)
+        st.download_button("📥 Export HR Directory", df_display.to_csv(index=False), "HR_Worker_List.csv")
+    
+    elif role == "Finance":
+        # Finance sees Bank Details and calculated Payouts
+        res = db.table("staff_master").select("name, bank_name, account_no, ifsc, daily_wage, attendance(status)").execute()
+        pay_rows = []
+        for r in res.data:
+            p = sum(1 for a in r['attendance'] if a['status'] == 'Present')
+            h = sum(1 for a in r['attendance'] if a['status'] == 'Half-Day')
+            net = (p * r['daily_wage']) + (h * (r['daily_wage']/2))
+            pay_rows.append({"Worker": r['name'], "Bank": r['bank_name'], "Acc No": r['account_no'], "IFSC": r['ifsc'], "Net Payable": net})
         
-        # Calculation:
-        # $$Net = (Days \times Wage) + (Half \times \frac{Wage}{2}) - Advances$$
-        net = (presents * r['daily_wage']) + (halfs * (r['daily_wage']/2)) - advs
-        pay_data.append({"Name": r['name'], "Acc": r['account_no'], "Net Pay": net})
-    
-    if pay_data:
-        pdf = pd.DataFrame(pay_data)
-        st.dataframe(pdf, use_container_width=True)
-        st.download_button("📥 Export CSV", pdf.to_csv(index=False), f"{active_dept}_pay.csv")
+        df_fin = pd.DataFrame(pay_rows)
+        st.subheader("Payout Summary (Finance View)")
+        st.dataframe(df_fin, use_container_width=True)
+        st.download_button("📥 Export Bank Transfer File", df_fin.to_csv(index=False), "Bank_Payouts.csv")
 
-# --- 5. RECORDS & FILTERS ---
-elif menu == "Records":
-    st.title(f"🔍 {active_dept} Search")
-    search = st.text_input("Find by Name or Aadhar")
-    res = db.table("staff_master").select("*").eq("department", active_dept).execute()
-    df = pd.DataFrame(res.data)
-    
-    if not df.empty:
-        if search:
-            df = df[df['name'].str.contains(search, case=False) | df['aadhar_no'].str.contains(search)]
-        st.dataframe(df, use_container_width=True)
+    elif role == "Admin":
+        # Admin sees EVERYTHING combined
+        res = db.table("staff_master").select("*, attendance(status)").execute()
+        admin_rows = []
+        for r in res.data:
+            p = sum(1 for a in r['attendance'] if a['status'] == 'Present')
+            h = sum(1 for a in r['attendance'] if a['status'] == 'Half-Day')
+            net = (p * r['daily_wage']) + (h * (r['daily_wage']/2))
+            r['Net Payout'] = net
+            admin_rows.append(r)
+        
+        df_admin = pd.DataFrame(admin_rows)
+        st.subheader("Master Records (Full View)")
+        st.dataframe(df_admin, use_container_width=True)
+        st.download_button("📥 Export Master Site Report", df_admin.to_csv(index=False), "Master_Site_Report.csv")
