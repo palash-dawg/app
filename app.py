@@ -20,14 +20,14 @@ def get_master_data():
     """Fetches staff and calculates serial Emp IDs and Payouts using vectorized math."""
     res = db.table("staff_master").select("*, attendance(status, date), advances(amount)").order("created_at").execute()
     
-    # BUG FIX 1: If database is wiped/empty, return an empty dataframe with correct columns to prevent KeyError
+    # Empty Database Shield (Prevents KeyError)
     if not res.data:
         return pd.DataFrame(columns=[
             'id', 'Emp ID', 'name', 'father_name', 'dob', 'mobile_no', 
             'aadhar_no', 'account_no', 'ifsc', 'daily_wage', 'photo_url', 
             'department', 'leave_date', 'created_at', 'Net Payout'
         ])
-    
+        
     df = pd.DataFrame(res.data)
     
     if not df.empty:
@@ -37,18 +37,13 @@ def get_master_data():
         
         # High-Speed Vectorized Payroll Math
         def fast_calc(row):
-            # Safe `.get()` used to prevent errors if sub-tables are completely empty
             att = row.get('attendance') or []
-            presents = sum(1 for x in att if x.get('status') == 'Present')
-            halfs = sum(1 for x in att if x.get('status') == 'Half-Day')
-            
-            advs_data = row.get('advances')
-            advs = sum(a.get('amount', 0) for a in advs_data) if isinstance(advs_data, list) else 0
-            
+            presents = sum(1 for x in att if x and x.get('status') == 'Present')
+            halfs = sum(1 for x in att if x and x.get('status') == 'Half-Day')
+            advs = sum(a.get('amount', 0) for a in row.get('advances', [])) if isinstance(row.get('advances'), list) else 0
             return (presents * row.get('daily_wage', 0)) + (halfs * (row.get('daily_wage', 0) / 2)) - advs
         
         df['Net Payout'] = df.apply(fast_calc, axis=1)
-    
     return df
 
 # --- 3. UTILITY: COMPRESSOR ---
@@ -83,7 +78,7 @@ page = st.sidebar.radio("Navigation", ["Worker Management", "Attendance Log", "A
 if st.sidebar.button("Logout"):
     del st.session_state["user_role"]; st.cache_data.clear(); st.rerun()
 
-# --- PAGE: WORKER MANAGEMENT (PAGINATED FOR SPEED) ---
+# --- PAGE: WORKER MANAGEMENT (PAGINATED FOR SPEED + SUMMARY CARD) ---
 if page == "Worker Management":
     st.header("📝 Registration & Directory")
     
@@ -113,29 +108,57 @@ if page == "Worker Management":
     # SPEED BOOST: PAGINATION
     df = get_master_data()
     if not df.empty:
-        # BUG FIX 2: Added .copy() to prevent Pandas SettingWithCopyWarning
         active_df = df[df['leave_date'].isna()].copy()
         st.subheader(f"📋 Active Directory ({len(active_df)} workers)")
         
         # Pagination Logic: 20 per page
         items_per_page = 20
-        total_pages = (len(active_df) // items_per_page) + 1
+        total_pages = max(1, (len(active_df) + items_per_page - 1) // items_per_page)
         curr_page = st.number_input("Page", min_value=1, max_value=total_pages, step=1)
         start_idx = (curr_page - 1) * items_per_page
         end_idx = start_idx + items_per_page
         
         page_data = active_df.iloc[start_idx:end_idx]
         
+        curr_month = datetime.now().month
+        curr_year = datetime.now().year
+
         for _, row in page_data.iterrows():
-            dc1, dc2, dc3, dc4 = st.columns([0.5, 3, 1.5, 1])
-            dc1.write(f"#{row['Emp ID']}")
-            dc2.write(f"**{row['name']}** | Mob: {row.get('mobile_no','N/A')}")
-            if dc3.button("Mark Left", key=f"l_{row['id']}"):
-                db.table("staff_master").update({"leave_date": str(datetime.now().date())}).eq("id", row['id']).execute()
-                st.cache_data.clear(); st.rerun()
-            if role == "Admin" and dc4.button("🗑️", key=f"d_{row['id']}"):
-                db.table("staff_master").delete().eq("id", row['id']).execute()
-                st.cache_data.clear(); st.rerun()
+            with st.container():
+                dc1, dc2, dc3, dc4 = st.columns([0.5, 3, 1.5, 1])
+                dc1.write(f"#{row['Emp ID']}")
+                dc2.write(f"**{row['name']}** | Mob: {row.get('mobile_no','N/A')}")
+                if dc3.button("Mark Left", key=f"l_{row['id']}"):
+                    db.table("staff_master").update({"leave_date": str(datetime.now().date())}).eq("id", row['id']).execute()
+                    st.cache_data.clear(); st.rerun()
+                if role == "Admin" and dc4.button("🗑️", key=f"d_{row['id']}"):
+                    db.table("staff_master").delete().eq("id", row['id']).execute()
+                    st.cache_data.clear(); st.rerun()
+
+                # --- SUMMARY CARD FOR ADMIN ---
+                if role == "Admin" or role == "Finance":
+                    with st.expander(f"📊 Financial Summary: {row['name']}"):
+                        # Calculate Present This Month
+                        att_list = row.get('attendance') or []
+                        presents_month = sum(
+                            1 for a in att_list 
+                            if a and a.get('status') == 'Present' 
+                            and datetime.strptime(a.get('date'), '%Y-%m-%d').month == curr_month 
+                            and datetime.strptime(a.get('date'), '%Y-%m-%d').year == curr_year
+                        )
+                        
+                        # Calculate Total Advances
+                        adv_list = row.get('advances') or []
+                        total_adv = sum(a.get('amount', 0) for a in adv_list)
+
+                        # Display Dashboard Metrics
+                        sc1, sc2, sc3 = st.columns(3)
+                        sc1.metric("Present (This Month)", presents_month)
+                        sc2.metric("Total Advances", f"₹{total_adv}")
+                        sc3.metric("Net Balance Payout", f"₹{row.get('Net Payout', 0)}")
+                st.divider() # Clean horizontal line between workers
+    else:
+        st.warning("No workers registered yet.")
 
 # --- PAGE: ATTENDANCE LOG (MARK ALL EXCEPT) ---
 elif page == "Attendance Log":
@@ -143,7 +166,6 @@ elif page == "Attendance Log":
     df = get_master_data()
     
     if not df.empty:
-        # BUG FIX 3: Added .copy() here as well
         active_df = df[df['leave_date'].isna()].copy()
         today = str(datetime.now().date())
         
@@ -158,7 +180,6 @@ elif page == "Attendance Log":
             if 'att_bulk' not in st.session_state: st.session_state.att_bulk = True
             active_df['Attend'] = st.session_state.att_bulk
             
-            # We use a limited view for editing to keep it fast
             edited = st.data_editor(active_df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
             
             if st.button("💾 Save Attendance"):
@@ -175,29 +196,23 @@ elif page == "Attendance Reports":
     st.header("📊 Reporting")
     df = get_master_data()
     
-    tab1, tab2 = st.tabs(["👤 Individual Audit", "👥 Team Summary"])
-    
-    with tab1:
-        # BUG FIX 4: Protected selectbox with empty check
-        if not df.empty:
+    if not df.empty:
+        tab1, tab2 = st.tabs(["👤 Individual Audit", "👥 Team Summary"])
+        
+        with tab1:
             worker = st.selectbox("Search Worker", df['name'].tolist())
             w_id = df[df['name'] == worker]['id'].values[0]
-            # Only fetch what's needed here to avoid lag
             logs = db.table("attendance").select("*").eq("staff_id", w_id).order("date", desc=True).limit(100).execute()
             if logs.data:
                 st.dataframe(pd.DataFrame(logs.data)[['date', 'status']], use_container_width=True)
             else:
-                st.info("No attendance logs found for this worker.")
-        else:
-            st.warning("No workers registered yet.")
+                st.info("No logs found.")
 
-    with tab2:
-        if not df.empty:
+        with tab2:
             period = st.radio("Period:", ["30 Days", "90 Days", "Full Year"], horizontal=True)
             days = 30 if "30" in period else (90 if "90" in period else 365)
             st.write(f"Showing performance summary for last {days} days.")
             
-            # Bulk Calculation Logic (Aggregated for Speed)
             summary_list = []
             cutoff = (datetime.now() - timedelta(days=days)).date()
             for _, row in df.iterrows():
@@ -209,8 +224,8 @@ elif page == "Attendance Reports":
             summary_df = pd.DataFrame(summary_list)
             st.dataframe(summary_df, use_container_width=True)
             st.download_button("📥 Export Report", summary_df.to_csv(index=False), f"Summary_{period}.csv")
-        else:
-            st.warning("No workers registered yet.")
+    else:
+        st.warning("No workers registered yet.")
 
 # --- PAGE: EXPORT CENTER ---
 elif page == "Export Center":
