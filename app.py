@@ -5,12 +5,12 @@ from PIL import Image
 import io
 from datetime import datetime
 
-# --- CONFIG & BRANDING ---
-st.set_page_config(page_title="KBP ENERGY PVT LTD - Site OS", layout="wide")
+# --- BRANDING & CONNECTION ---
+st.set_page_config(page_title="KBP ENERGY PVT LTD", layout="wide")
 db = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-# --- MODULE: 100KB ITERATIVE COMPRESSOR ---
-def compress_id_photo(uploaded_file):
+# --- MODULE: IMAGE COMPRESSOR (< 100KB) ---
+def compress_worker_photo(uploaded_file):
     img = Image.open(uploaded_file).convert("RGB")
     quality, img_io = 80, io.BytesIO()
     while True:
@@ -21,136 +21,156 @@ def compress_id_photo(uploaded_file):
         if quality < 30: img = img.resize((int(img.width * 0.9), int(img.height * 0.9)))
     return img_io.getvalue()
 
-# --- MODULE: SEQUENTIAL SHUFFLING LOGIC ---
-def get_sequenced_staff():
-    """Fetches staff sorted by joining date. Serial IDs (1,2,3) re-shuffle automatically."""
-    res = db.table("staff_master").select("*").order("created_at").execute()
+# --- MODULE: SEQUENTIAL ID LOGIC ---
+def get_processed_data():
+    """Fetches staff and assigns a serial 'Emp ID' based on joining date."""
+    res = db.table("staff_master").select("*, attendance(status), advances(amount)").order("created_at").execute()
     df = pd.DataFrame(res.data)
     if not df.empty:
-        # Sort by joining date (oldest to newest)
         df = df.sort_values(by="created_at").reset_index(drop=True)
-        # Create the Serial Employee ID starting from 1
         df.insert(0, 'Emp ID', range(1, len(df) + 1))
+        
+        # Calculate Net Payouts for Finance/Admin
+        def calc_net(row):
+            presents = sum(1 for a in row['attendance'] if a['status'] == 'Present')
+            halfs = sum(1 for a in row['attendance'] if a['status'] == 'Half-Day')
+            advs = sum(adv['amount'] for adv in row['advances']) if isinstance(row['advances'], list) else 0
+            return (presents * row['daily_wage']) + (halfs * (row['daily_wage'] / 2)) - advs
+        
+        df['Net Payout'] = df.apply(calc_net, axis=1)
     return df
 
-# --- AUTH SYSTEM ---
+# --- AUTH GATE ---
 if "user_role" not in st.session_state:
     st.title("🏗️ KBP ENERGY PVT LTD")
-    st.subheader("Workforce Management Portal")
     with st.form("login"):
-        u = st.text_input("Username").lower()
-        p = st.text_input("Password", type="password")
+        u, p = st.text_input("Username").lower(), st.text_input("Password", type="password")
         if st.form_submit_button("Log In"):
             creds = st.secrets["CREDENTIALS"]
             if u in creds and creds[u] == p:
-                if "admin" in u: st.session_state.user_role = "Admin"
-                elif "hr" in u: st.session_state.user_role = "HR"
-                elif "fin" in u: st.session_state.user_role = "Finance"
+                st.session_state.user_role = "Admin" if "admin" in u else ("HR" if "hr" in u else "Finance")
                 st.rerun()
             else: st.error("Access Denied")
     st.stop()
 
 role = st.session_state.user_role
-st.sidebar.title("⚡ KBP ENERGY")
-st.sidebar.write(f"Logged as: **{role}**")
-page = st.sidebar.radio("Navigation", ["Worker Registration", "Bulk Attendance", "Financials & Exports"])
+st.sidebar.title("KBP ENERGY")
+st.sidebar.write(f"Role: **{role}**")
+page = st.sidebar.radio("Navigation", ["Registration", "Attendance Log", "Data Export"])
 
 if st.sidebar.button("Logout"):
     del st.session_state["user_role"]; st.rerun()
 
-# --- PAGE 1: REGISTRATION (HR & ADMIN ONLY) ---
-if page == "Worker Registration":
+# --- PAGE 1: REGISTRATION ---
+if page == "Registration":
     if role == "Finance":
-        st.error("Access Denied.")
+        st.error("Finance does not have permission to register workers.")
     else:
-        st.title("📝 Worker Registration")
+        st.header("📝 New Worker Registration")
         with st.form("reg_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            name = col1.text_input("Worker Name*")
-            father = col2.text_input("Father's Name*")
-            dob = col1.date_input("Date of Birth", min_value=datetime(1960,1,1))
-            aadhar = col2.text_input("Aadhar Number (Unique)*")
+            c1, c2 = st.columns(2)
+            name, father = c1.text_input("Full Name*"), c2.text_input("Father's Name*")
+            dob, aadhar = c1.date_input("DOB", min_value=datetime(1960,1,1)), c2.text_input("Aadhar Number*")
             
             st.divider()
             b1, b2, b3 = st.columns(3)
-            bank = b1.text_input("Bank Name")
-            acc = b2.text_input("Account Number (Unique)*")
-            ifsc = b3.text_input("IFSC Code")
+            bank, acc, ifsc = b1.text_input("Bank"), b2.text_input("Account No*"), b3.text_input("IFSC")
             wage = st.number_input("Daily Wage (₹)", value=500)
-            
-            photo = st.file_uploader("Upload ID Photo (<100KB Auto)", type=['jpg','png'])
+            photo = st.file_uploader("ID Photo", type=['jpg','png'])
 
-            if st.form_submit_button("Register Worker"):
+            if st.form_submit_button("Add Worker"):
                 # Duplication Check
                 dup = db.table("staff_master").select("id").or_(f"aadhar_no.eq.{aadhar},account_no.eq.{acc}").execute()
                 if dup.data:
-                    st.error("🚨 DUPLICATION BLOCKED: Aadhar or Account Number already exists!")
+                    st.error("🚨 DUPLICATE FOUND: Aadhar or Account already exists!")
                 elif not name or not aadhar or not acc:
-                    st.error("Name, Aadhar, and Account Number are mandatory.")
+                    st.error("Please fill Name, Aadhar, and Account.")
                 else:
-                    p_url = ""
+                    url = ""
                     if photo:
-                        img_bytes = compress_id_photo(photo)
+                        img = compress_worker_photo(photo)
                         path = f"ids/{aadhar}.jpg"
-                        db.storage.from_("staff_files").upload(path, img_bytes, {"content-type": "image/jpeg"})
-                        p_url = db.storage.from_("staff_files").get_public_url(path)
+                        db.storage.from_("staff_files").upload(path, img, {"content-type": "image/jpeg"})
+                        url = db.storage.from_("staff_files").get_public_url(path)
                     
                     db.table("staff_master").insert({
                         "name": name, "father_name": father, "dob": str(dob), "aadhar_no": aadhar,
                         "bank_name": bank, "account_no": acc, "ifsc": ifsc, 
-                        "daily_wage": wage, "photo_url": p_url, "department": role
+                        "daily_wage": wage, "photo_url": url, "department": role
                     }).execute()
-                    st.success("Worker Registered. Serial IDs updated.")
+                    st.success("Worker Registered. ID Sequence Shuffled.")
 
-# --- PAGE 2: BULK ATTENDANCE (FAST MARKING) ---
-elif page == "Bulk Attendance":
-    st.title("📅 Bulk Attendance Control")
-    df = get_sequenced_staff()
+# --- PAGE 2: ATTENDANCE (MARK ALL EXCEPT...) ---
+elif page == "Attendance Log":
+    st.header("📅 Daily Attendance Log")
+    df = get_processed_data()
     
     if not df.empty:
-        c1, c2, c3 = st.columns([1,1,2])
-        m_all = c1.button("✅ Mark ALL Present")
-        m_none = c2.button("❌ Mark ALL Absent")
+        st.subheader("Selection Tools")
+        c1, c2, _ = st.columns([1, 1, 2])
+        if c1.button("✅ Mark All Present"): st.session_state.att_val = True
+        if c2.button("❌ Mark All Absent"): st.session_state.att_val = False
         
-        # Logic: Mark All Except...
-        if 'att_df' not in st.session_state or m_all or m_none:
-            df['Status'] = True if m_all else False
-            st.session_state.att_df = df[['Emp ID', 'name', 'aadhar_no', 'Status']]
-
-        st.write("Tick the boxes for those present. Untick for those absent.")
-        edited = st.data_editor(st.session_state.att_df, use_container_width=True, hide_index=True)
+        # Default state
+        if 'att_val' not in st.session_state: st.session_state.att_val = True
         
-        if st.button("🔥 Confirm & Save Attendance"):
-            present_list = edited[edited['Status'] == True]
-            # Batch upsert to database (Simplified logic)
-            st.success(f"Attendance recorded for {len(present_list)} workers.")
-    else:
-        st.info("No workers registered yet.")
+        df['Attend'] = st.session_state.att_val
+        st.write("Instruction: Use buttons to mark all, then **untick** specific people (the 'Except' list).")
+        
+        edited = st.data_editor(df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
+        
+        if st.button("💾 Save Today's Attendance"):
+            batch = []
+            for _, r in edited.iterrows():
+                # Find the actual ID from the original DF using Emp ID
+                actual_id = df[df['Emp ID'] == r['Emp ID']]['id'].values[0]
+                batch.append({
+                    "staff_id": actual_id, 
+                    "date": str(datetime.now().date()), 
+                    "status": "Present" if r['Attend'] else "Absent"
+                })
+            db.table("attendance").upsert(batch).execute()
+            st.success(f"Log saved for {len(batch)} workers.")
 
-# --- PAGE 3: EXPORTS (ROLE-BASED VIEWS) ---
-elif page == "Financials & Exports":
-    st.title(f"💰 {role} Data Vault")
-    df = get_sequenced_staff()
+# --- PAGE 3: EXPORTS (ROLE-BASED POWERS) ---
+elif page == "Data Export":
+    st.header(f"📥 {role} Export Center")
+    df = get_processed_data()
     
     if not df.empty:
-        if role == "HR":
-            # HR: IDs, Photos, Personal
-            output = df[['Emp ID', 'name', 'father_name', 'dob', 'aadhar_no', 'photo_url']]
-            st.subheader("HR Staff Directory")
+        # Define Column Groups
+        hr_cols = ['Emp ID', 'name', 'father_name', 'dob', 'aadhar_no', 'photo_url']
+        fin_cols = ['Emp ID', 'name', 'bank_name', 'account_no', 'ifsc', 'daily_wage', 'Net Payout']
         
-        elif role == "Finance":
-            # Finance: Bank, Wage, Net Payouts
-            # Note: Math logic for payout calculation goes here
-            output = df[['Emp ID', 'name', 'bank_name', 'account_no', 'ifsc', 'daily_wage']]
-            st.subheader("Finance & Bank Transfer Records")
+        # --- ADMIN VIEW ---
+        if role == "Admin":
+            st.subheader("Master Controls")
+            col1, col2, col3 = st.columns(3)
             
-        elif role == "Admin":
-            # Admin: Combined
-            output = df
-            st.subheader("Master Site Audit Report")
+            with col1:
+                st.write("**HR Data**")
+                st.download_button("Download HR CSV", df[hr_cols].to_csv(index=False), "HR_Report.csv")
+            
+            with col2:
+                st.write("**Financial Data**")
+                st.download_button("Download Financial CSV", df[fin_cols].to_csv(index=False), "Finance_Report.csv")
+                
+            with col3:
+                st.write("**Master Data**")
+                st.download_button("Download ALL Data", df.to_csv(index=False), "Full_Master_Report.csv")
+            
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
-        st.dataframe(output, use_container_width=True, hide_index=True)
-        
-        # Combined CSV Export
-        csv = output.to_csv(index=False).encode('utf-8')
-        st.download_button(f"📥 Download {role} Export", csv, f"KBP_ENERGY_{role}_Report.csv")
+        # --- HR VIEW ---
+        elif role == "HR":
+            st.subheader("Personal Records")
+            st.dataframe(df[hr_cols], use_container_width=True, hide_index=True)
+            st.download_button("📥 Export HR CSV", df[hr_cols].to_csv(index=False), "KBP_HR_Report.csv")
+
+        # --- FINANCE VIEW ---
+        elif role == "Finance":
+            st.subheader("Financial Records")
+            st.dataframe(df[fin_cols], use_container_width=True, hide_index=True)
+            st.download_button("📥 Export Finance CSV", df[fin_cols].to_csv(index=False), "KBP_Finance_Report.csv")
+    else:
+        st.info("No data available to export.")
