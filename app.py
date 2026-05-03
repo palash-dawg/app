@@ -43,30 +43,58 @@ def sync_to_sheets(row_data):
         st.warning(f"Google Sheets backup skipped/failed: Check if sheet is named 'KBP_WORKFORCE_BACKUP' and shared. Error: {e}")
 
 def upload_csv_to_drive(df):
-    """Updates a pre-existing Google Sheet with a full database snapshot to bypass Drive Quota limits."""
+    """Creates a Payroll Summary AND a Day-by-Day Calendar Grid in Google Sheets."""
     try:
         creds = init_google()
         client = gspread.authorize(creds)
+        spreadsheet = client.open("KBP_FULL_SNAPSHOT")
         
-        # Connect to the human-owned sheet
-        sheet = client.open("KBP_FULL_SNAPSHOT").sheet1
-        
-        # FIX: Remove 'department' column before exporting
+        # --- PART 1: MASTER SUMMARY ---
+        # Same as before, but we target a specific sheet name
+        try:
+            summary_sheet = spreadsheet.worksheet("Master_Summary")
+        except:
+            summary_sheet = spreadsheet.add_worksheet(title="Master_Summary", rows="1000", cols="20")
+            
         export_df = df.drop(columns=['department']) if 'department' in df.columns else df
+        safe_df = export_df.fillna("").astype(str)
+        summary_data = [safe_df.columns.values.tolist()] + safe_df.values.tolist()
         
-        # FIX: Replace all empty cells (NaN) with blank strings so Google doesn't crash
-        safe_df = export_df.fillna("")
-        safe_df = safe_df.astype(str)
+        summary_sheet.clear()
+        summary_sheet.update('A1', summary_data)
+
+        # --- PART 2: CALENDAR GRID (DAY-BY-DAY) ---
+        try:
+            grid_sheet = spreadsheet.worksheet("Attendance_Grid")
+        except:
+            grid_sheet = spreadsheet.add_worksheet(title="Attendance_Grid", rows="1000", cols="40")
+
+        # Extract attendance into a flat list
+        raw_att = []
+        for _, row in df.iterrows():
+            att_list = row.get('attendance') or []
+            for entry in att_list:
+                if entry:
+                    raw_att.append({
+                        "Name": row['name'],
+                        "Date": entry.get('date'),
+                        "Status": entry.get('status')[0] # 'P', 'A', or 'H'
+                    })
         
-        data_list = [safe_df.columns.values.tolist()] + safe_df.values.tolist()
+        if raw_att:
+            att_df = pd.DataFrame(raw_att)
+            # Pivot the data: Names on rows, Dates on columns
+            pivot_df = att_df.pivot(index='Name', columns='Date', values='Status').fillna("-")
+            pivot_df.reset_index(inplace=True)
+            
+            grid_data = [pivot_df.columns.values.tolist()] + pivot_df.values.tolist()
+            grid_sheet.clear()
+            grid_sheet.update('A1', grid_data)
         
-        # Wipe the old backup and paste the new one instantly
-        sheet.clear()
-        sheet.update('A1', data_list)
+        st.success("✅ Double-Tab Backup (Summary + Grid) Synced Successfully!")
         
-        st.success("✅ Master Archive Synced to Google Drive Successfully!")
     except Exception as e:
-        st.error(f"Google Drive Snapshot Failed: {e}")
+        st.error(f"Google Drive Backup Failed: {e}")
 
 # --- 3. DATA ENGINE ---
 @st.cache_data(ttl=600)
