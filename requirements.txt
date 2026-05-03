@@ -1,5 +1,5 @@
 streamlit
-supabase 
-google-generativeai 
+supabase
+google-generativeai
 pandas
 Pillow
