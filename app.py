@@ -71,7 +71,12 @@ def upload_csv_to_drive(df):
 # --- 3. DATA ENGINE ---
 @st.cache_data(ttl=600)
 def get_master_data():
-    res = db.table("staff_master").select("*, attendance(status, date), advances(amount)").order("created_at").execute()
+    try:
+        # Added error checking here so it doesn't fail silently if Supabase RLS is on!
+        res = db.table("staff_master").select("*, attendance(status, date), advances(amount)").order("created_at").execute()
+    except Exception as e:
+        st.error(f"🚨 DATABASE ERROR: {e} (Check Supabase RLS Policies)")
+        return pd.DataFrame()
     
     if not res.data:
         return pd.DataFrame(columns=[
@@ -264,11 +269,12 @@ elif page == "Attendance Reports":
             
             st.dataframe(pd.DataFrame(summary_list), use_container_width=True)
 
-# --- PAGE: EXPORT CENTER (WITH GOOGLE DRIVE PUSH & TRIAL CLEANUP) ---
+# --- PAGE: EXPORT CENTER ---
 elif page == "Export Center":
     st.header("📥 Exports & Backups")
     df = get_master_data()
     
+    # EXPORTS BLOCK (Only shows if there is data)
     if not df.empty:
         c1, c2 = st.columns(2)
         if role == "Admin" or role == "HR":
@@ -283,71 +289,72 @@ elif page == "Export Center":
             if st.button("🚀 Backup Full Master to Google Drive"):
                 with st.spinner("Pushing to Vault..."):
                     upload_csv_to_drive(df)
-            
-            st.divider()
-            st.subheader("🛠️ Developer Tools")
-            if st.button("🧹 Clean Up Trial Data"):
-                with st.spinner("Deleting trial records..."):
-                    try:
-                        db.table("staff_master").delete().ilike("name", "%(Trial)").execute()
-                        st.cache_data.clear()
-                        st.success("✅ All Trial Data Successfully Deleted!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error deleting data: {e}")
-            
-            # --- MAGIC GENERATOR FOR TESTING ---
-            st.divider()
-            st.subheader("🧪 Stress Test Tools")
-            if st.button("🪄 Generate 100 Trial Workers + Attendance"):
-                with st.spinner("Injecting 100 Workers & 1,000 Attendance Records..."):
-                    try:
-                        # 1. Create 100 Worker Profiles
-                        workers_db = []
-                        workers_sheet = []
-                        for i in range(1, 101):
-                            name = f"Test Worker {i} (Trial)"
-                            aadhar = str(100000000000 + i)
-                            acc = str(500000000000 + i)
-                            
-                            # Prepare for Supabase
-                            workers_db.append({
-                                "name": name, "father_name": "Test Father", "dob": "1990-01-01", 
-                                "mobile_no": "9999999999", "aadhar_no": aadhar, 
-                                "account_no": acc, "ifsc": "KBP0001", "daily_wage": 500, "department": role
-                            })
-                            
-                            # Prepare for Google Sheets
-                            workers_sheet.append([name, "Test Father", "1990-01-01", "9999999999", aadhar, acc, "KBP0001", 500, str(datetime.now())])
-                        
-                        # 2. BULK INSERT to Supabase Staff Master
-                        res = db.table("staff_master").insert(workers_db).execute()
-                        
-                        # 3. Generate 10 Days of Attendance for all 100 workers
-                        att_db = []
-                        for worker in res.data: # Uses the new IDs Supabase just created
-                            for d in range(1, 11): 
-                                date_str = str((datetime.now() - timedelta(days=d)).date())
-                                # 85% chance they were Present, 15% Absent
-                                status = "Present" if random.random() > 0.15 else "Absent"
-                                att_db.append({"staff_id": worker['id'], "date": date_str, "status": status})
-                        
-                        # BULK INSERT to Supabase Attendance
-                        # We chunk it into two batches of 500 to prevent database timeout
-                        db.table("attendance").insert(att_db[:500]).execute()
-                        db.table("attendance").insert(att_db[500:]).execute()
-
-                        # 4. BULK INSERT to Google Sheets 
-                        creds = init_google()
-                        client = gspread.authorize(creds)
-                        sheet = client.open("KBP_WORKFORCE_BACKUP").sheet1
-                        sheet.append_rows(workers_sheet) # Note: append_rows (plural) bypasses quota limits
-                        
-                        st.cache_data.clear()
-                        st.success("✅ 100 Workers & 1,000 Attendance Records injected everywhere!")
-                        st.rerun()
-                        
-                    except Exception as e:
-                        st.error(f"Generation Error: {e}")
     else:
         st.warning("No data available to export.")
+
+    # DEVELOPER TOOLS BLOCK (Always shows for Admin, even if empty!)
+    if role == "Admin":
+        st.divider()
+        st.subheader("🛠️ Developer Tools")
+        if st.button("🧹 Clean Up Trial Data"):
+            with st.spinner("Deleting trial records..."):
+                try:
+                    db.table("staff_master").delete().ilike("name", "%(Trial)").execute()
+                    st.cache_data.clear()
+                    st.success("✅ All Trial Data Successfully Deleted!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error deleting data: {e}")
+        
+        # --- MAGIC GENERATOR FOR TESTING ---
+        st.divider()
+        st.subheader("🧪 Stress Test Tools")
+        if st.button("🪄 Generate 100 Trial Workers + Attendance"):
+            with st.spinner("Injecting 100 Workers & 1,000 Attendance Records..."):
+                try:
+                    # 1. Create 100 Worker Profiles
+                    workers_db = []
+                    workers_sheet = []
+                    for i in range(1, 101):
+                        name = f"Test Worker {i} (Trial)"
+                        aadhar = str(100000000000 + i)
+                        acc = str(500000000000 + i)
+                        
+                        # Prepare for Supabase
+                        workers_db.append({
+                            "name": name, "father_name": "Test Father", "dob": "1990-01-01", 
+                            "mobile_no": "9999999999", "aadhar_no": aadhar, 
+                            "account_no": acc, "ifsc": "KBP0001", "daily_wage": 500, "department": role
+                        })
+                        
+                        # Prepare for Google Sheets
+                        workers_sheet.append([name, "Test Father", "1990-01-01", "9999999999", aadhar, acc, "KBP0001", 500, str(datetime.now())])
+                    
+                    # 2. BULK INSERT to Supabase Staff Master
+                    res = db.table("staff_master").insert(workers_db).execute()
+                    
+                    # 3. Generate 10 Days of Attendance for all 100 workers
+                    att_db = []
+                    for worker in res.data: # Uses the new IDs Supabase just created
+                        for d in range(1, 11): 
+                            date_str = str((datetime.now() - timedelta(days=d)).date())
+                            # 85% chance they were Present, 15% Absent
+                            status = "Present" if random.random() > 0.15 else "Absent"
+                            att_db.append({"staff_id": worker['id'], "date": date_str, "status": status})
+                    
+                    # BULK INSERT to Supabase Attendance
+                    db.table("attendance").insert(att_db[:500]).execute()
+                    db.table("attendance").insert(att_db[500:]).execute()
+
+                    # 4. BULK INSERT to Google Sheets 
+                    creds = init_google()
+                    client = gspread.authorize(creds)
+                    sheet = client.open("KBP_WORKFORCE_BACKUP").sheet1
+                    sheet.append_rows(workers_sheet) # Note: append_rows (plural) bypasses quota limits
+                    
+                    st.cache_data.clear()
+                    st.success("✅ 100 Workers & 1,000 Attendance Records injected everywhere!")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Generation Error: {e}")
