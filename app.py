@@ -50,9 +50,10 @@ def upload_csv_to_drive(df):
         # Connect to the human-owned sheet
         sheet = client.open("KBP_FULL_SNAPSHOT").sheet1
         
-        # Convert DataFrame to a format Google Sheets can read
-        # We convert everything to strings to prevent date/number format crashes
-        safe_df = df.astype(str)
+        # FIX: Replace all empty cells (NaN) with blank strings so Google doesn't crash
+        safe_df = df.fillna("")
+        safe_df = safe_df.astype(str)
+        
         data_list = [safe_df.columns.values.tolist()] + safe_df.values.tolist()
         
         # Wipe the old backup and paste the new one instantly
@@ -62,7 +63,6 @@ def upload_csv_to_drive(df):
         st.success("✅ Master Archive Synced to Google Drive Successfully!")
     except Exception as e:
         st.error(f"Google Drive Snapshot Failed: {e}")
-
 # --- 3. DATA ENGINE ---
 @st.cache_data(ttl=600)
 def get_master_data():
