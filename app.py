@@ -19,6 +19,15 @@ db = init_db()
 def get_master_data():
     """Fetches staff and calculates serial Emp IDs and Payouts using vectorized math."""
     res = db.table("staff_master").select("*, attendance(status, date), advances(amount)").order("created_at").execute()
+    
+    # BUG FIX 1: If database is wiped/empty, return an empty dataframe with correct columns to prevent KeyError
+    if not res.data:
+        return pd.DataFrame(columns=[
+            'id', 'Emp ID', 'name', 'father_name', 'dob', 'mobile_no', 
+            'aadhar_no', 'account_no', 'ifsc', 'daily_wage', 'photo_url', 
+            'department', 'leave_date', 'created_at', 'Net Payout'
+        ])
+    
     df = pd.DataFrame(res.data)
     
     if not df.empty:
@@ -27,15 +36,19 @@ def get_master_data():
         df.insert(0, 'Emp ID', range(1, len(df) + 1))
         
         # High-Speed Vectorized Payroll Math
-        # Instead of row-by-row, we count in bulk
         def fast_calc(row):
-            att = row['attendance']
-            presents = sum(1 for x in att if x['status'] == 'Present')
-            halfs = sum(1 for x in att if x['status'] == 'Half-Day')
-            advs = sum(a['amount'] for a in row['advances']) if isinstance(row['advances'], list) else 0
-            return (presents * row['daily_wage']) + (halfs * (row['daily_wage'] / 2)) - advs
+            # Safe `.get()` used to prevent errors if sub-tables are completely empty
+            att = row.get('attendance') or []
+            presents = sum(1 for x in att if x.get('status') == 'Present')
+            halfs = sum(1 for x in att if x.get('status') == 'Half-Day')
+            
+            advs_data = row.get('advances')
+            advs = sum(a.get('amount', 0) for a in advs_data) if isinstance(advs_data, list) else 0
+            
+            return (presents * row.get('daily_wage', 0)) + (halfs * (row.get('daily_wage', 0) / 2)) - advs
         
         df['Net Payout'] = df.apply(fast_calc, axis=1)
+    
     return df
 
 # --- 3. UTILITY: COMPRESSOR ---
@@ -100,7 +113,8 @@ if page == "Worker Management":
     # SPEED BOOST: PAGINATION
     df = get_master_data()
     if not df.empty:
-        active_df = df[df['leave_date'].isna()]
+        # BUG FIX 2: Added .copy() to prevent Pandas SettingWithCopyWarning
+        active_df = df[df['leave_date'].isna()].copy()
         st.subheader(f"📋 Active Directory ({len(active_df)} workers)")
         
         # Pagination Logic: 20 per page
@@ -127,27 +141,34 @@ if page == "Worker Management":
 elif page == "Attendance Log":
     st.header("📅 Daily Log")
     df = get_master_data()
-    active_df = df[df['leave_date'].isna()]
-    today = str(datetime.now().date())
     
-    if not active_df.empty:
-        tc1, tc2, tc3 = st.columns([1,1,1])
-        if tc1.button("✅ Mark ALL Present"): st.session_state.att_bulk = True
-        if tc2.button("❌ Mark ALL Absent"): st.session_state.att_bulk = False
-        if tc3.button("🔄 Reset Today"):
-            db.table("attendance").delete().eq("date", today).execute()
-            st.cache_data.clear(); st.rerun()
+    if not df.empty:
+        # BUG FIX 3: Added .copy() here as well
+        active_df = df[df['leave_date'].isna()].copy()
+        today = str(datetime.now().date())
+        
+        if not active_df.empty:
+            tc1, tc2, tc3 = st.columns([1,1,1])
+            if tc1.button("✅ Mark ALL Present"): st.session_state.att_bulk = True
+            if tc2.button("❌ Mark ALL Absent"): st.session_state.att_bulk = False
+            if tc3.button("🔄 Reset Today"):
+                db.table("attendance").delete().eq("date", today).execute()
+                st.cache_data.clear(); st.rerun()
 
-        if 'att_bulk' not in st.session_state: st.session_state.att_bulk = True
-        active_df['Attend'] = st.session_state.att_bulk
-        
-        # We use a limited view for editing to keep it fast
-        edited = st.data_editor(active_df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
-        
-        if st.button("💾 Save Attendance"):
-            batch = [{"staff_id": active_df[active_df['Emp ID'] == r['Emp ID']]['id'].values[0], "date": today, "status": "Present" if r['Attend'] else "Absent"} for _, r in edited.iterrows()]
-            db.table("attendance").upsert(batch).execute()
-            st.cache_data.clear(); st.success("Synced.")
+            if 'att_bulk' not in st.session_state: st.session_state.att_bulk = True
+            active_df['Attend'] = st.session_state.att_bulk
+            
+            # We use a limited view for editing to keep it fast
+            edited = st.data_editor(active_df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
+            
+            if st.button("💾 Save Attendance"):
+                batch = [{"staff_id": active_df[active_df['Emp ID'] == r['Emp ID']]['id'].values[0], "date": today, "status": "Present" if r['Attend'] else "Absent"} for _, r in edited.iterrows()]
+                db.table("attendance").upsert(batch).execute()
+                st.cache_data.clear(); st.success("Synced.")
+        else:
+            st.info("No active workers to mark.")
+    else:
+        st.warning("No workers registered yet.")
 
 # --- PAGE: ATTENDANCE REPORTS (TEAM SUMMARY) ---
 elif page == "Attendance Reports":
@@ -157,29 +178,39 @@ elif page == "Attendance Reports":
     tab1, tab2 = st.tabs(["👤 Individual Audit", "👥 Team Summary"])
     
     with tab1:
-        worker = st.selectbox("Search Worker", df['name'].tolist())
-        w_id = df[df['name'] == worker]['id'].values[0]
-        # Only fetch what's needed here to avoid lag
-        logs = db.table("attendance").select("*").eq("staff_id", w_id).order("date", desc=True).limit(100).execute()
-        st.dataframe(pd.DataFrame(logs.data)[['date', 'status']], use_container_width=True)
+        # BUG FIX 4: Protected selectbox with empty check
+        if not df.empty:
+            worker = st.selectbox("Search Worker", df['name'].tolist())
+            w_id = df[df['name'] == worker]['id'].values[0]
+            # Only fetch what's needed here to avoid lag
+            logs = db.table("attendance").select("*").eq("staff_id", w_id).order("date", desc=True).limit(100).execute()
+            if logs.data:
+                st.dataframe(pd.DataFrame(logs.data)[['date', 'status']], use_container_width=True)
+            else:
+                st.info("No attendance logs found for this worker.")
+        else:
+            st.warning("No workers registered yet.")
 
     with tab2:
-        period = st.radio("Period:", ["30 Days", "90 Days", "Full Year"], horizontal=True)
-        days = 30 if "30" in period else (90 if "90" in period else 365)
-        st.write(f"Showing performance summary for last {days} days.")
-        
-        # Bulk Calculation Logic (Aggregated for Speed)
-        summary_list = []
-        cutoff = (datetime.now() - timedelta(days=days)).date()
-        for _, row in df.iterrows():
-            att = [a for a in row['attendance'] if datetime.strptime(a['date'], '%Y-%m-%d').date() >= cutoff]
-            p = sum(1 for x in att if x['status'] == 'Present')
-            a = sum(1 for x in att if x['status'] == 'Absent')
-            summary_list.append({"Emp ID": row['Emp ID'], "Name": row['name'], "Presents": p, "Absents": a, "Rate": f"{round((p/(p+a))*100,1)}%" if (p+a)>0 else "0%"})
-        
-        summary_df = pd.DataFrame(summary_list)
-        st.dataframe(summary_df, use_container_width=True)
-        st.download_button("📥 Export Report", summary_df.to_csv(index=False), f"Summary_{period}.csv")
+        if not df.empty:
+            period = st.radio("Period:", ["30 Days", "90 Days", "Full Year"], horizontal=True)
+            days = 30 if "30" in period else (90 if "90" in period else 365)
+            st.write(f"Showing performance summary for last {days} days.")
+            
+            # Bulk Calculation Logic (Aggregated for Speed)
+            summary_list = []
+            cutoff = (datetime.now() - timedelta(days=days)).date()
+            for _, row in df.iterrows():
+                att = [a for a in row.get('attendance', []) if a and datetime.strptime(a['date'], '%Y-%m-%d').date() >= cutoff]
+                p = sum(1 for x in att if x['status'] == 'Present')
+                a = sum(1 for x in att if x['status'] == 'Absent')
+                summary_list.append({"Emp ID": row['Emp ID'], "Name": row['name'], "Presents": p, "Absents": a, "Rate": f"{round((p/(p+a))*100,1)}%" if (p+a)>0 else "0%"})
+            
+            summary_df = pd.DataFrame(summary_list)
+            st.dataframe(summary_df, use_container_width=True)
+            st.download_button("📥 Export Report", summary_df.to_csv(index=False), f"Summary_{period}.csv")
+        else:
+            st.warning("No workers registered yet.")
 
 # --- PAGE: EXPORT CENTER ---
 elif page == "Export Center":
@@ -191,3 +222,5 @@ elif page == "Export Center":
             c1.download_button("📥 Export HR (With Leave Date)", df[['Emp ID','name','mobile_no','dob','leave_date','aadhar_no']].to_csv(index=False), "HR_Master.csv")
         if role == "Admin" or role == "Finance":
             c2.download_button("📥 Export Finance (Bank File)", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Payouts.csv")
+    else:
+        st.warning("No data available to export.")
