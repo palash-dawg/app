@@ -101,7 +101,7 @@ def upload_csv_to_drive(df):
 def get_master_data():
     try:
         # Added error checking here so it doesn't fail silently if Supabase RLS is on!
-        res = db.table("staff_master").select("*, attendance(status, date), advances(amount)").order("created_at").execute()
+        res = db.table("staff_master").select("*, attendance!attendance_staff_id_fkey(status, date), advances(amount)").order("created_at").execute()
     except Exception as e:
         st.error(f"🚨 DATABASE ERROR: {e} (Check Supabase RLS Policies)")
         return pd.DataFrame()
