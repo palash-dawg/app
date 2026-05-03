@@ -5,8 +5,6 @@ from PIL import Image
 import io
 from datetime import datetime, timedelta
 import gspread
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2.service_account import Credentials
 
 # --- 1. BRANDING & DB CONFIG ---
@@ -44,24 +42,26 @@ def sync_to_sheets(row_data):
         st.warning(f"Google Sheets backup skipped/failed: Check if sheet is named 'KBP_WORKFORCE_BACKUP' and shared. Error: {e}")
 
 def upload_csv_to_drive(df):
-    """Uploads the full Master Data CSV to Google Drive."""
+    """Updates a pre-existing Google Sheet with a full database snapshot to bypass Drive Quota limits."""
     try:
         creds = init_google()
-        service = build('drive', 'v3', credentials=creds)
+        client = gspread.authorize(creds)
         
-        csv_buffer = io.BytesIO()
-        df.to_csv(csv_buffer, index=False)
-        csv_buffer.seek(0)
+        # Connect to the human-owned sheet
+        sheet = client.open("KBP_FULL_SNAPSHOT").sheet1
         
-        file_metadata = {
-            'name': f'KBP_Backup_{datetime.now().strftime("%Y-%m-%d_%H-%M")}.csv',
-            'parents': [st.secrets["google_drive"]["folder_id"]]
-        }
-        media = MediaIoBaseUpload(csv_buffer, mimetype='text/csv')
-        service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        st.success("✅ Master Archive Saved to Google Drive Successfully!")
+        # Convert DataFrame to a format Google Sheets can read
+        # We convert everything to strings to prevent date/number format crashes
+        safe_df = df.astype(str)
+        data_list = [safe_df.columns.values.tolist()] + safe_df.values.tolist()
+        
+        # Wipe the old backup and paste the new one instantly
+        sheet.clear()
+        sheet.update('A1', data_list)
+        
+        st.success("✅ Master Archive Synced to Google Drive Successfully!")
     except Exception as e:
-        st.error(f"Google Drive Backup Failed: {e}")
+        st.error(f"Google Drive Snapshot Failed: {e}")
 
 # --- 3. DATA ENGINE ---
 @st.cache_data(ttl=600)
