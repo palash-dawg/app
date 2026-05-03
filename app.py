@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="KBP ENERGY PVT LTD", layout="wide")
 db = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-# --- MODULE: IMAGE COMPRESSOR (< 100KB) ---
+# --- MODULE: IMAGE COMPRESSOR ---
 def compress_worker_photo(uploaded_file):
     img = Image.open(uploaded_file).convert("RGB")
     quality, img_io = 80, io.BytesIO()
@@ -54,7 +54,7 @@ if "user_role" not in st.session_state:
 role = st.session_state.user_role
 st.sidebar.title("KBP ENERGY")
 st.sidebar.write(f"Role: **{role}**")
-page = st.sidebar.radio("Navigation", ["Worker Management", "Attendance Log", "Individual Tracker", "Financials & Export"])
+page = st.sidebar.radio("Navigation", ["Worker Management", "Attendance Log", "Attendance History", "Export Center"])
 
 if st.sidebar.button("Logout"):
     del st.session_state["user_role"]; st.rerun()
@@ -68,49 +68,51 @@ if page == "Worker Management":
                 c1, c2 = st.columns(2)
                 name = c1.text_input("Full Name*")
                 father = c2.text_input("Father's Name*")
-                dob = c1.date_input("Date of Birth*", min_value=datetime(1950, 1, 1), max_value=datetime(2008, 1, 1))
-                # Real-time limits using max_chars
-                mobile = c2.text_input("Mobile Number (10 Digits)*", max_chars=10, help="Enter 10 digit Indian mobile no")
-                aadhar = c1.text_input("Aadhar Number (12 Digits)*", max_chars=12)
-                acc = c2.text_input("Bank Account No*", max_chars=18)
-                ifsc = c1.text_input("IFSC Code*", max_chars=11).upper()
+                
+                # INDIAN DATA LIMITS (Real-time char limits)
+                mobile = c1.text_input("Mobile Number (10 Digits)*", max_chars=10)
+                aadhar = c2.text_input("Aadhar Number (12 Digits)*", max_chars=12)
+                
+                dob = c1.date_input("Date of Birth", min_value=datetime(1960,1,1))
+                acc = c2.text_input("Account No (9-18 Digits)*", max_chars=18)
+                
+                ifsc = c1.text_input("IFSC Code (11 Chars)*", max_chars=11)
                 wage = c2.number_input("Daily Wage (₹)", value=500)
+                
                 photo = st.file_uploader("ID Photo", type=['jpg','png'])
 
                 if st.form_submit_button("Add Worker"):
-                    if len(mobile) != 10 or not mobile.isdigit(): st.error("Invalid Mobile Number")
-                    elif len(aadhar) != 12 or not aadhar.isdigit(): st.error("Invalid Aadhar Number")
-                    elif not name or not acc: st.error("Fill mandatory fields.")
+                    dup = db.table("staff_master").select("id").or_(f"aadhar_no.eq.{aadhar},account_no.eq.{acc}").execute()
+                    if dup.data: st.error("🚨 DUPLICATE FOUND: Aadhar or Account exists!")
+                    elif len(mobile) != 10: st.error("Mobile must be 10 digits.")
+                    elif len(aadhar) != 12: st.error("Aadhar must be 12 digits.")
                     else:
                         url = ""
                         if photo:
                             img = compress_worker_photo(photo)
-                            path = f"ids/{aadhar}.jpg"; db.storage.from_("staff_files").upload(path, img, {"content-type": "image/jpeg"})
+                            path = f"ids/{aadhar}.jpg"
+                            db.storage.from_("staff_files").upload(path, img, {"content-type": "image/jpeg"})
                             url = db.storage.from_("staff_files").get_public_url(path)
-                        db.table("staff_master").insert({
-                            "name": name, "father_name": father, "dob": str(dob), 
-                            "mobile": mobile, "aadhar_no": aadhar, "account_no": acc, 
-                            "ifsc": ifsc, "daily_wage": wage, "photo_url": url, "department": role
-                        }).execute()
-                        st.success("Worker Registered."); st.rerun()
+                        db.table("staff_master").insert({"name": name, "father_name": father, "mobile_no": mobile, "aadhar_no": aadhar, "account_no": acc, "ifsc": ifsc, "dob": str(dob), "daily_wage": wage, "photo_url": url, "department": role}).execute()
+                        st.success("Worker Registered. ID Sequence Shuffled."); st.rerun()
 
     df = get_processed_data()
     if not df.empty:
         st.subheader("📋 Worker Directory")
-        for index, row in df.iterrows():
+        for _, row in df.iterrows():
             c1, c2, c3 = st.columns([1, 4, 1])
             c1.write(f"**ID: {row['Emp ID']}**")
-            c2.write(f"{row['name']} | 📞 {row['mobile']} | 🎂 {row['dob']}")
-            if role == "Admin":
-                if c3.button("🗑️ Delete", key=f"del_{row['id']}"):
-                    db.table("staff_master").delete().eq("id", row['id']).execute()
-                    st.rerun()
+            c2.write(f"{row['name']} | Mob: {row['mobile_no']} | Aadhar: {row['aadhar_no']}")
+            if role == "Admin" and c3.button("🗑️", key=f"del_{row['id']}"):
+                db.table("staff_master").delete().eq("id", row['id']).execute()
+                st.rerun()
 
-# --- PAGE 2: ATTENDANCE (MARK ALL EXCEPT...) ---
+# --- PAGE 2: ATTENDANCE LOG (MARK ALL EXCEPT...) ---
 elif page == "Attendance Log":
     st.header("📅 Daily Attendance Log")
     df = get_processed_data()
     today = str(datetime.now().date())
+    
     if not df.empty:
         c1, c2, c3 = st.columns([1, 1, 1])
         if c1.button("✅ Mark All Present"): st.session_state.att_state = True
@@ -118,60 +120,64 @@ elif page == "Attendance Log":
         if c3.button("🔄 Redo Today"):
             db.table("attendance").delete().eq("date", today).execute()
             st.rerun()
-        
+
         if 'att_state' not in st.session_state: st.session_state.att_state = True
         df['Attend'] = st.session_state.att_state
-        st.info("💡 **Algorithm:** Click 'Mark All Present', then **untick** workers who are absent.")
+        
+        st.info("💡 **Mark All Except:** Use buttons above, then **untick** workers who are absent.")
         edited = st.data_editor(df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
         
         if st.button("💾 Save Attendance"):
-            batch = [{"staff_id": df[df['Emp ID'] == r['Emp ID']]['id'].values[0], "date": today, "status": "Present" if r['Attend'] else "Absent"} for _, r in edited.iterrows()]
+            batch = []
+            for _, r in edited.iterrows():
+                actual_id = df[df['Emp ID'] == r['Emp ID']]['id'].values[0]
+                batch.append({"staff_id": actual_id, "date": today, "status": "Present" if r['Attend'] else "Absent"})
             db.table("attendance").upsert(batch).execute()
-            st.success("Synced.")
+            st.success("Attendance Synced.")
 
-# --- PAGE 3: INDIVIDUAL TRACKER ---
-elif page == "Individual Tracker":
-    st.header("🔍 Worker Attendance History")
+# --- PAGE 3: INDIVIDUAL ATTENDANCE HISTORY ---
+elif page == "Attendance History":
+    st.header("👤 Individual Attendance Tracker")
     df = get_processed_data()
     if not df.empty:
-        worker_names = df['name'].tolist()
-        choice = st.selectbox("Select Worker to Check Attendance", worker_names)
-        worker_row = df[df['name'] == choice].iloc[0]
+        worker_choice = st.selectbox("Select Worker", df['name'].tolist())
+        worker_id = df[df['name'] == worker_choice]['id'].values[0]
         
-        att_history = pd.DataFrame(worker_row['attendance'])
-        if not att_history.empty:
-            att_history = att_history.sort_values(by="date", ascending=False)
-            st.write(f"Showing logs for **{choice}**")
-            st.dataframe(att_history, use_container_width=True)
-        else: st.info("No attendance logs for this worker yet.")
+        time_range = st.radio("View History For:", ["Last Month", "Last 3 Months", "This Year"], horizontal=True)
+        days = 30 if "Month" in time_range else (90 if "3" in time_range else 365)
+        start_date = (datetime.now() - timedelta(days=days)).date()
+        
+        history = db.table("attendance").select("*").eq("staff_id", worker_id).gte("date", str(start_date)).order("date").execute()
+        
+        if history.data:
+            h_df = pd.DataFrame(history.data)
+            st.write(f"Attendance for **{worker_choice}** since {start_date}")
+            st.dataframe(h_df[['date', 'status']], use_container_width=True)
+        else:
+            st.info("No records found for this period.")
 
-# --- PAGE 4: FINANCIALS & EXPORT (TIME-BASED) ---
-elif page == "Financials & Export":
-    st.header("💰 Financial Center")
+# --- PAGE 4: EXPORT CENTER (TIME-BASED EXPORTS) ---
+elif page == "Export Center":
+    st.header("📥 Data Export Center")
     df = get_processed_data()
     
     if not df.empty:
-        st.subheader("Time-Based Exports")
-        exp_c1, exp_c2, exp_c3 = st.columns(3)
+        period = st.radio("Export Period:", ["Current Month", "Last 3 Months", "Yearly"], horizontal=True)
+        days = 30 if "Month" in period else (90 if "3" in period else 365)
+        start_date = (datetime.now() - timedelta(days=days)).date()
         
-        # Date filtering logic
-        def filter_data(days):
-            cutoff = datetime.now() - timedelta(days=days)
-            # This is a simplified filter on the already fetched data
-            return df # In a real app, you'd filter the attendance list within the DF rows
-
-        with exp_c1:
-            st.download_button("📥 Last 30 Days CSV", df.to_csv(index=False), "Monthly_Report.csv")
-        with exp_c2:
-            st.download_button("📥 Last 90 Days CSV", df.to_csv(index=False), "Quarterly_Report.csv")
-        with exp_c3:
-            st.download_button("📥 Yearly Master CSV", df.to_csv(index=False), "Yearly_Report.csv")
-
-        st.divider()
+        # Filter Logic for Export
+        hr_cols = ['Emp ID', 'name', 'mobile_no', 'dob', 'aadhar_no']
+        fin_cols = ['Emp ID', 'name', 'bank_name', 'account_no', 'ifsc', 'Net Payout']
+        
         if role == "Admin":
-            st.subheader("Role-Specific Exports")
-            col1, col2 = st.columns(2)
-            col1.download_button("📥 HR Report (Personal)", df[['Emp ID','name','father_name','dob','mobile','aadhar_no']].to_csv(index=False), "HR_Report.csv")
-            col2.download_button("📥 Finance Report (Bank)", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Report.csv")
+            c1, c2, c3 = st.columns(3)
+            c1.download_button("HR Report (CSV)", df[hr_cols].to_csv(index=False), f"KBP_HR_{period}.csv")
+            c2.download_button("Finance Report (CSV)", df[fin_cols].to_csv(index=False), f"KBP_FIN_{period}.csv")
+            c3.download_button("Full Master Report", df.to_csv(index=False), "KBP_Master.csv")
+        elif role == "HR":
+            st.download_button("Export Worker Details", df[hr_cols].to_csv(index=False), "KBP_HR.csv")
+        elif role == "Finance":
+            st.download_button("Export Banking Details", df[fin_cols].to_csv(index=False), "KBP_FIN.csv")
         
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, use_container_width=True)
