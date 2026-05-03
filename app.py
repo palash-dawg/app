@@ -3,6 +3,7 @@ import pandas as pd
 from supabase import create_client
 from PIL import Image
 import io
+import random
 from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
@@ -294,5 +295,59 @@ elif page == "Export Center":
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error deleting data: {e}")
+            
+            # --- MAGIC GENERATOR FOR TESTING ---
+            st.divider()
+            st.subheader("🧪 Stress Test Tools")
+            if st.button("🪄 Generate 100 Trial Workers + Attendance"):
+                with st.spinner("Injecting 100 Workers & 1,000 Attendance Records..."):
+                    try:
+                        # 1. Create 100 Worker Profiles
+                        workers_db = []
+                        workers_sheet = []
+                        for i in range(1, 101):
+                            name = f"Test Worker {i} (Trial)"
+                            aadhar = str(100000000000 + i)
+                            acc = str(500000000000 + i)
+                            
+                            # Prepare for Supabase
+                            workers_db.append({
+                                "name": name, "father_name": "Test Father", "dob": "1990-01-01", 
+                                "mobile_no": "9999999999", "aadhar_no": aadhar, 
+                                "account_no": acc, "ifsc": "KBP0001", "daily_wage": 500, "department": role
+                            })
+                            
+                            # Prepare for Google Sheets
+                            workers_sheet.append([name, "Test Father", "1990-01-01", "9999999999", aadhar, acc, "KBP0001", 500, str(datetime.now())])
+                        
+                        # 2. BULK INSERT to Supabase Staff Master
+                        res = db.table("staff_master").insert(workers_db).execute()
+                        
+                        # 3. Generate 10 Days of Attendance for all 100 workers
+                        att_db = []
+                        for worker in res.data: # Uses the new IDs Supabase just created
+                            for d in range(1, 11): 
+                                date_str = str((datetime.now() - timedelta(days=d)).date())
+                                # 85% chance they were Present, 15% Absent
+                                status = "Present" if random.random() > 0.15 else "Absent"
+                                att_db.append({"staff_id": worker['id'], "date": date_str, "status": status})
+                        
+                        # BULK INSERT to Supabase Attendance
+                        # We chunk it into two batches of 500 to prevent database timeout
+                        db.table("attendance").insert(att_db[:500]).execute()
+                        db.table("attendance").insert(att_db[500:]).execute()
+
+                        # 4. BULK INSERT to Google Sheets 
+                        creds = init_google()
+                        client = gspread.authorize(creds)
+                        sheet = client.open("KBP_WORKFORCE_BACKUP").sheet1
+                        sheet.append_rows(workers_sheet) # Note: append_rows (plural) bypasses quota limits
+                        
+                        st.cache_data.clear()
+                        st.success("✅ 100 Workers & 1,000 Attendance Records injected everywhere!")
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"Generation Error: {e}")
     else:
         st.warning("No data available to export.")
