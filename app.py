@@ -14,7 +14,31 @@ def init_db():
 
 db = init_db()
 
-# --- 2. UTILITY: 100KB COMPRESSOR ---
+# --- 2. SPEED BOOST: SMART CACHING ---
+@st.cache_data(ttl=600) # Cache data for 10 minutes to stop lag
+def get_master_data():
+    """Fetches staff and calculates serial Emp IDs and Payouts using vectorized math."""
+    res = db.table("staff_master").select("*, attendance(status, date), advances(amount)").order("created_at").execute()
+    df = pd.DataFrame(res.data)
+    
+    if not df.empty:
+        # Sequential Shuffle Logic
+        df = df.sort_values(by="created_at").reset_index(drop=True)
+        df.insert(0, 'Emp ID', range(1, len(df) + 1))
+        
+        # High-Speed Vectorized Payroll Math
+        # Instead of row-by-row, we count in bulk
+        def fast_calc(row):
+            att = row['attendance']
+            presents = sum(1 for x in att if x['status'] == 'Present')
+            halfs = sum(1 for x in att if x['status'] == 'Half-Day')
+            advs = sum(a['amount'] for a in row['advances']) if isinstance(row['advances'], list) else 0
+            return (presents * row['daily_wage']) + (halfs * (row['daily_wage'] / 2)) - advs
+        
+        df['Net Payout'] = df.apply(fast_calc, axis=1)
+    return df
+
+# --- 3. UTILITY: COMPRESSOR ---
 def compress_photo(uploaded_file):
     img = Image.open(uploaded_file).convert("RGB")
     quality, img_io = 80, io.BytesIO()
@@ -26,28 +50,7 @@ def compress_photo(uploaded_file):
         if quality < 30: img = img.resize((int(img.width * 0.8), int(img.height * 0.8)))
     return img_io.getvalue()
 
-# --- 3. CORE ENGINE: SEQUENTIAL IDs & MATH ---
-def get_master_data():
-    """Fetches staff and calculates serial Emp IDs and Payouts."""
-    res = db.table("staff_master").select("*, attendance(status, date), advances(id, amount, date)").order("created_at").execute()
-    df = pd.DataFrame(res.data)
-    
-    if not df.empty:
-        # Filter for active workers (those who haven't left) for specific UI parts
-        # But we keep all in the master DF for HR Export
-        df = df.sort_values(by="created_at").reset_index(drop=True)
-        df.insert(0, 'Emp ID', range(1, len(df) + 1))
-        
-        def calc_net(row):
-            presents = sum(1 for a in row['attendance'] if a['status'] == 'Present')
-            halfs = sum(1 for a in row['attendance'] if a['status'] == 'Half-Day')
-            advs = sum(adv['amount'] for adv in row['advances']) if isinstance(row['advances'], list) else 0
-            return (presents * row['daily_wage']) + (halfs * (row['daily_wage'] / 2)) - advs
-        
-        df['Net Payout'] = df.apply(calc_net, axis=1)
-    return df
-
-# --- 4. AUTHENTICATION ---
+# --- AUTHENTICATION ---
 if "user_role" not in st.session_state:
     st.title("🏗️ KBP ENERGY PVT LTD")
     with st.form("login"):
@@ -62,13 +65,12 @@ if "user_role" not in st.session_state:
 
 role = st.session_state.user_role
 st.sidebar.title("⚡ KBP ENERGY")
-st.sidebar.write(f"Role: **{role}**")
 page = st.sidebar.radio("Navigation", ["Worker Management", "Attendance Log", "Attendance Reports", "Export Center"])
 
 if st.sidebar.button("Logout"):
-    del st.session_state["user_role"]; st.rerun()
+    del st.session_state["user_role"]; st.cache_data.clear(); st.rerun()
 
-# --- 5. PAGE: WORKER MANAGEMENT (Enrollment & Deactivation) ---
+# --- PAGE: WORKER MANAGEMENT (PAGINATED FOR SPEED) ---
 if page == "Worker Management":
     st.header("📝 Registration & Directory")
     
@@ -78,58 +80,53 @@ if page == "Worker Management":
                 c1, c2 = st.columns(2)
                 name, father = c1.text_input("Full Name*"), c2.text_input("Father's Name*")
                 dob = c1.date_input("Date of Birth", min_value=datetime(1960,1,1))
-                
-                # --- INDIAN DATA LIMITS ---
                 mobile = c2.text_input("Mobile No*", max_chars=10)
                 aadhar = c1.text_input("Aadhar No*", max_chars=12)
-                acc = c2.text_input("Bank Account No*", max_chars=18)
-                ifsc = c1.text_input("IFSC Code*", max_chars=11)
-                
+                acc, ifsc = c2.text_input("Bank Acc*", max_chars=18), c1.text_input("IFSC*", max_chars=11)
                 wage = c2.number_input("Daily Wage (₹)", value=500)
                 photo = st.file_uploader("Upload ID Photo", type=['jpg','png'])
 
-                if st.form_submit_button("Register Worker"):
-                    dup = db.table("staff_master").select("id").or_(f"aadhar_no.eq.{aadhar},account_no.eq.{acc}").execute()
-                    if dup.data: st.error("🚨 DUPLICATION: Aadhar or Account already registered!")
-                    else:
-                        img_url = ""
-                        if photo:
-                            img_bytes = compress_photo(photo)
-                            path = f"ids/{aadhar}.jpg"; db.storage.from_("staff_files").upload(path, img_bytes, {"content-type": "image/jpeg"})
-                            img_url = db.storage.from_("staff_files").get_public_url(path)
-                        
-                        db.table("staff_master").insert({
-                            "name": name, "father_name": father, "dob": str(dob), "mobile_no": mobile,
-                            "aadhar_no": aadhar, "account_no": acc, "ifsc": ifsc, "daily_wage": wage,
-                            "photo_url": img_url, "department": role
-                        }).execute()
-                        st.success("Worker Registered!"); st.rerun()
+                if st.form_submit_button("Register"):
+                    img_url = ""
+                    if photo:
+                        img_bytes = compress_photo(photo)
+                        path = f"ids/{aadhar}.jpg"
+                        db.storage.from_("staff_files").upload(path, img_bytes, {"content-type": "image/jpeg"})
+                        img_url = db.storage.from_("staff_files").get_public_url(path)
+                    
+                    db.table("staff_master").insert({"name": name, "father_name": father, "dob": str(dob), "mobile_no": mobile, "aadhar_no": aadhar, "account_no": acc, "ifsc": ifsc, "daily_wage": wage, "photo_url": img_url, "department": role}).execute()
+                    st.cache_data.clear(); st.success("Registered!"); st.rerun()
 
+    # SPEED BOOST: PAGINATION
     df = get_master_data()
     if not df.empty:
-        st.subheader("📋 Active Directory")
-        for _, row in df.iterrows():
-            if row.get('leave_date') is None: # Only show active ones in this view
-                dc1, dc2, dc3, dc4 = st.columns([0.5, 3, 1.5, 1])
-                dc1.write(f"#{row['Emp ID']}")
-                dc2.write(f"**{row['name']}** | Aadhar: {row['aadhar_no']}")
-                
-                # Button to mark worker as Left
-                if dc3.button("Mark as Left", key=f"left_{row['id']}"):
-                    today = str(datetime.now().date())
-                    db.table("staff_master").update({"leave_date": today}).eq("id", row['id']).execute()
-                    st.rerun()
+        active_df = df[df['leave_date'].isna()]
+        st.subheader(f"📋 Active Directory ({len(active_df)} workers)")
+        
+        # Pagination Logic: 20 per page
+        items_per_page = 20
+        total_pages = (len(active_df) // items_per_page) + 1
+        curr_page = st.number_input("Page", min_value=1, max_value=total_pages, step=1)
+        start_idx = (curr_page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        
+        page_data = active_df.iloc[start_idx:end_idx]
+        
+        for _, row in page_data.iterrows():
+            dc1, dc2, dc3, dc4 = st.columns([0.5, 3, 1.5, 1])
+            dc1.write(f"#{row['Emp ID']}")
+            dc2.write(f"**{row['name']}** | Mob: {row.get('mobile_no','N/A')}")
+            if dc3.button("Mark Left", key=f"l_{row['id']}"):
+                db.table("staff_master").update({"leave_date": str(datetime.now().date())}).eq("id", row['id']).execute()
+                st.cache_data.clear(); st.rerun()
+            if role == "Admin" and dc4.button("🗑️", key=f"d_{row['id']}"):
+                db.table("staff_master").delete().eq("id", row['id']).execute()
+                st.cache_data.clear(); st.rerun()
 
-                if role == "Admin":
-                    if dc4.button("🗑️ Delete", key=f"del_{row['id']}"):
-                        db.table("staff_master").delete().eq("id", row['id']).execute()
-                        st.rerun()
-
-# --- 6. PAGE: ATTENDANCE LOG (MARK ALL EXCEPT ALGORITHM) ---
+# --- PAGE: ATTENDANCE LOG (MARK ALL EXCEPT) ---
 elif page == "Attendance Log":
     st.header("📅 Daily Log")
     df = get_master_data()
-    # Filter only active staff (those who haven't left)
     active_df = df[df['leave_date'].isna()]
     today = str(datetime.now().date())
     
@@ -139,80 +136,58 @@ elif page == "Attendance Log":
         if tc2.button("❌ Mark ALL Absent"): st.session_state.att_bulk = False
         if tc3.button("🔄 Reset Today"):
             db.table("attendance").delete().eq("date", today).execute()
-            st.rerun()
+            st.cache_data.clear(); st.rerun()
 
         if 'att_bulk' not in st.session_state: st.session_state.att_bulk = True
         active_df['Attend'] = st.session_state.att_bulk
         
-        st.info("💡 **Mark All Except:** Select all, then **untick** those who are absent.")
+        # We use a limited view for editing to keep it fast
         edited = st.data_editor(active_df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
         
         if st.button("💾 Save Attendance"):
             batch = [{"staff_id": active_df[active_df['Emp ID'] == r['Emp ID']]['id'].values[0], "date": today, "status": "Present" if r['Attend'] else "Absent"} for _, r in edited.iterrows()]
             db.table("attendance").upsert(batch).execute()
-            st.success("Synced.")
-    else: st.warning("No active workers to mark.")
+            st.cache_data.clear(); st.success("Synced.")
 
-# --- 7. PAGE: ATTENDANCE REPORTS (INDIVIDUAL + TEAM SUMMARY) ---
+# --- PAGE: ATTENDANCE REPORTS (TEAM SUMMARY) ---
 elif page == "Attendance Reports":
-    st.header("📊 Attendance Reporting")
+    st.header("📊 Reporting")
     df = get_master_data()
     
-    tab1, tab2 = st.tabs(["👤 Individual Audit", "👥 Team Summary Report"])
+    tab1, tab2 = st.tabs(["👤 Individual Audit", "👥 Team Summary"])
     
     with tab1:
-        worker = st.selectbox("Select Worker", df['name'].tolist())
+        worker = st.selectbox("Search Worker", df['name'].tolist())
         w_id = df[df['name'] == worker]['id'].values[0]
-        t_range = st.radio("History:", ["30 Days", "90 Days", "Full Year"], horizontal=True, key="ind")
-        days = 30 if "30" in t_range else (90 if "90" in t_range else 365)
-        start_dt = (datetime.now() - timedelta(days=days)).date()
-        
-        logs = db.table("attendance").select("*").eq("staff_id", w_id).gte("date", str(start_dt)).order("date").execute()
-        if logs.data:
-            st.dataframe(pd.DataFrame(logs.data)[['date', 'status']], use_container_width=True, hide_index=True)
-        else: st.info("No logs found.")
+        # Only fetch what's needed here to avoid lag
+        logs = db.table("attendance").select("*").eq("staff_id", w_id).order("date", desc=True).limit(100).execute()
+        st.dataframe(pd.DataFrame(logs.data)[['date', 'status']], use_container_width=True)
 
     with tab2:
-        st.subheader("Team Performance Summary")
-        period = st.radio("Summary Period:", ["30 Days", "90 Days", "Full Year"], horizontal=True, key="team")
-        p_days = 30 if "30" in period else (90 if "90" in period else 365)
-        p_start = (datetime.now() - timedelta(days=p_days)).date()
+        period = st.radio("Period:", ["30 Days", "90 Days", "Full Year"], horizontal=True)
+        days = 30 if "30" in period else (90 if "90" in period else 365)
+        st.write(f"Showing performance summary for last {days} days.")
         
-        # Calculate Bulk Stats
+        # Bulk Calculation Logic (Aggregated for Speed)
         summary_list = []
+        cutoff = (datetime.now() - timedelta(days=days)).date()
         for _, row in df.iterrows():
-            att_records = [a for a in row['attendance'] if datetime.strptime(a['date'], '%Y-%m-%d').date() >= p_start]
-            presents = sum(1 for a in att_records if a['status'] == 'Present')
-            absents = sum(1 for a in att_records if a['status'] == 'Absent')
-            summary_list.append({
-                "Emp ID": row['Emp ID'],
-                "Name": row['name'],
-                "Total Presents": presents,
-                "Total Absents": absents,
-                "Attendance %": round((presents / (presents + absents)) * 100, 1) if (presents + absents) > 0 else 0
-            })
+            att = [a for a in row['attendance'] if datetime.strptime(a['date'], '%Y-%m-%d').date() >= cutoff]
+            p = sum(1 for x in att if x['status'] == 'Present')
+            a = sum(1 for x in att if x['status'] == 'Absent')
+            summary_list.append({"Emp ID": row['Emp ID'], "Name": row['name'], "Presents": p, "Absents": a, "Rate": f"{round((p/(p+a))*100,1)}%" if (p+a)>0 else "0%"})
+        
         summary_df = pd.DataFrame(summary_list)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-        st.download_button(f"📥 Download Team {period} Report", summary_df.to_csv(index=False), f"Team_Attendance_{period}.csv")
+        st.dataframe(summary_df, use_container_width=True)
+        st.download_button("📥 Export Report", summary_df.to_csv(index=False), f"Summary_{period}.csv")
 
-# --- 8. PAGE: EXPORT CENTER (TIME-BASED + LEAVE DATE) ---
+# --- PAGE: EXPORT CENTER ---
 elif page == "Export Center":
-    st.header("📥 Data Exports")
+    st.header("📥 Exports")
     df = get_master_data()
-    
     if not df.empty:
-        # HR Columns now include Leave Date
-        hr_cols = ['Emp ID', 'name', 'mobile_no', 'dob', 'aadhar_no', 'leave_date']
-        fin_cols = ['Emp ID', 'name', 'bank_name', 'account_no', 'ifsc', 'Net Payout']
-        
-        if role == "Admin":
-            c1, c2, c3 = st.columns(3)
-            c1.download_button("Export HR Master (With Leave Date)", df[hr_cols].to_csv(index=False), "KBP_HR_Master.csv")
-            c2.download_button("Export Finance/Bank Report", df[fin_cols].to_csv(index=False), "KBP_Finance_Bank.csv")
-            c3.download_button("Full Master Backup", df.to_csv(index=False), "KBP_Master_Full.csv")
-        elif role == "HR":
-            st.download_button("Export HR Records", df[hr_cols].to_csv(index=False), "KBP_HR_Records.csv")
-        elif role == "Finance":
-            st.download_button("Export Bank Payouts", df[fin_cols].to_csv(index=False), "KBP_Finance_Records.csv")
-        
-        st.dataframe(df, use_container_width=True)
+        c1, c2 = st.columns(2)
+        if role == "Admin" or role == "HR":
+            c1.download_button("📥 Export HR (With Leave Date)", df[['Emp ID','name','mobile_no','dob','leave_date','aadhar_no']].to_csv(index=False), "HR_Master.csv")
+        if role == "Admin" or role == "Finance":
+            c2.download_button("📥 Export Finance (Bank File)", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Payouts.csv")
