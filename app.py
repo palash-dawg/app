@@ -3,11 +3,23 @@ import pandas as pd
 from supabase import create_client
 from PIL import Image
 import io
+import re
 from datetime import datetime
 
 # --- BRANDING & CONNECTION ---
 st.set_page_config(page_title="KBP ENERGY PVT LTD", layout="wide")
 db = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+# --- MODULE: INDIAN DATA VALIDATION ---
+def validate_indian_data(aadhar, acc, ifsc):
+    errors = []
+    if not re.fullmatch(r'\d{12}', aadhar):
+        errors.append("Aadhar must be exactly 12 digits.")
+    if not (9 <= len(acc) <= 18 and acc.isdigit()):
+        errors.append("Indian Bank Account numbers are usually 9-18 digits.")
+    if not re.fullmatch(r'^[A-Z]{4}0[A-Z0-9]{6}$', ifsc.upper()):
+        errors.append("Invalid IFSC format (Example: SBIN0001234).")
+    return errors
 
 # --- MODULE: IMAGE COMPRESSOR (< 100KB) ---
 def compress_worker_photo(uploaded_file):
@@ -23,7 +35,6 @@ def compress_worker_photo(uploaded_file):
 
 # --- MODULE: SEQUENTIAL ID LOGIC & DATA FETCH ---
 def get_processed_data():
-    """Fetches staff and assigns a serial 'Emp ID' based on joining date."""
     res = db.table("staff_master").select("*, attendance(status, date), advances(id, amount, date)").order("created_at").execute()
     df = pd.DataFrame(res.data)
     if not df.empty:
@@ -34,7 +45,6 @@ def get_processed_data():
             presents = sum(1 for a in row['attendance'] if a['status'] == 'Present')
             halfs = sum(1 for a in row['attendance'] if a['status'] == 'Half-Day')
             advs = sum(adv['amount'] for adv in row['advances']) if isinstance(row['advances'], list) else 0
-            # Formula: (Present Days * Wage) + (Half Days * Wage/2) - Advances
             return (presents * row['daily_wage']) + (halfs * (row['daily_wage'] / 2)) - advs
         
         df['Net Payout'] = df.apply(calc_net, axis=1)
@@ -61,7 +71,7 @@ page = st.sidebar.radio("Navigation", ["Worker Management", "Attendance Log", "F
 if st.sidebar.button("Logout"):
     del st.session_state["user_role"]; st.rerun()
 
-# --- PAGE 1: WORKER MANAGEMENT (Registration & Deletion) ---
+# --- PAGE 1: WORKER MANAGEMENT ---
 if page == "Worker Management":
     st.header("📝 Worker Management")
     
@@ -69,35 +79,40 @@ if page == "Worker Management":
         with st.expander("➕ Register New Worker"):
             with st.form("reg_form", clear_on_submit=True):
                 c1, c2 = st.columns(2)
-                name, father = c1.text_input("Full Name*"), c2.text_input("Father's Name*")
-                dob = c1.date_input("Date of Birth", min_value=datetime(1960, 1, 1), max_value=datetime.now())
-                aadhar = c2.text_input("Aadhar Number*")
-                acc = c1.text_input("Account No*")
-                wage = c2.number_input("Daily Wage (₹)", value=500)
+                name = c1.text_input("Full Name*")
+                father = c2.text_input("Father's Name*")
+                dob = c1.date_input("Date of Birth*", min_value=datetime(1950,1,1), max_value=datetime(2008,1,1))
+                aadhar = c2.text_input("Aadhar Number (12 Digits)*")
+                
+                st.divider()
+                b1, b2 = st.columns(2)
+                acc = b1.text_input("Bank Account No*")
+                ifsc = b2.text_input("IFSC Code (Example: SBIN0001234)*")
+                wage = st.number_input("Daily Wage (₹)", value=500)
                 photo = st.file_uploader("ID Photo", type=['jpg','png'])
 
                 if st.form_submit_button("Add Worker"):
-                    dup = db.table("staff_master").select("id").or_(f"aadhar_no.eq.{aadhar},account_no.eq.{acc}").execute()
-                    if dup.data: st.error("🚨 DUPLICATE Aadhar or Account!")
-                    elif not name or not aadhar or not acc: st.error("Fill mandatory fields.")
+                    # Validate Indian Standards
+                    val_errors = validate_indian_data(aadhar, acc, ifsc)
+                    
+                    if val_errors:
+                        for err in val_errors: st.error(err)
                     else:
-                        url = ""
-                        if photo:
-                            img = compress_worker_photo(photo)
-                            path = f"ids/{aadhar}.jpg"; db.storage.from_("staff_files").upload(path, img, {"content-type": "image/jpeg"})
-                            url = db.storage.from_("staff_files").get_public_url(path)
-                        
-                        db.table("staff_master").insert({
-                            "name": name, 
-                            "father_name": father, 
-                            "dob": str(dob), 
-                            "aadhar_no": aadhar, 
-                            "account_no": acc, 
-                            "daily_wage": wage, 
-                            "photo_url": url, 
-                            "department": role
-                        }).execute()
-                        st.success("Worker Registered. IDs Shuffled."); st.rerun()
+                        dup = db.table("staff_master").select("id").or_(f"aadhar_no.eq.{aadhar},account_no.eq.{acc}").execute()
+                        if dup.data: st.error("🚨 DUPLICATE Aadhar or Account found in database!")
+                        else:
+                            url = ""
+                            if photo:
+                                img = compress_worker_photo(photo)
+                                path = f"ids/{aadhar}.jpg"; db.storage.from_("staff_files").upload(path, img, {"content-type": "image/jpeg"})
+                                url = db.storage.from_("staff_files").get_public_url(path)
+                            
+                            db.table("staff_master").insert({
+                                "name": name, "father_name": father, "dob": str(dob), 
+                                "aadhar_no": aadhar, "account_no": acc, "ifsc": ifsc.upper(), 
+                                "daily_wage": wage, "photo_url": url, "department": role
+                            }).execute()
+                            st.success("Worker Registered. ID Shuffling complete."); st.rerun()
 
     st.subheader("📋 Worker Directory")
     df = get_processed_data()
@@ -105,15 +120,14 @@ if page == "Worker Management":
         for index, row in df.iterrows():
             c1, c2, c3 = st.columns([1, 4, 1])
             c1.write(f"**ID: {row['Emp ID']}**")
-            # Added DOB to the display line
             c2.write(f"{row['name']} | DOB: {row['dob']} | Aadhar: {row['aadhar_no']}")
             if role == "Admin":
                 if c3.button("🗑️ Delete", key=f"del_{row['id']}"):
                     db.table("staff_master").delete().eq("id", row['id']).execute()
-                    st.toast(f"Deleted {row['name']}"); st.rerun()
+                    st.rerun()
     else: st.info("No workers registered.")
 
-# --- PAGE 2: ATTENDANCE ---
+# --- PAGE 2: ATTENDANCE (MARK ALL EXCEPT ALGORITHM) ---
 elif page == "Attendance Log":
     st.header("📅 Daily Attendance Log")
     df = get_processed_data()
@@ -126,23 +140,22 @@ elif page == "Attendance Log":
         
         if c3.button("🔄 Redo Today (Clear Logs)"):
             db.table("attendance").delete().eq("date", today).execute()
-            st.warning("Today's logs cleared. You can start over."); st.rerun()
+            st.rerun()
 
         if 'att_state' not in st.session_state: st.session_state.att_state = True
         
         df['Attend'] = st.session_state.att_state
-        st.write("---")
-        st.info("💡 **Mark All Except Algorithm:** Click 'Mark All Present', then **untick** workers who are absent.")
+        st.info("💡 **Algorithm:** Click 'Mark All Present', then simply **untick** those who are absent.")
         
         edited = st.data_editor(df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
         
-        if st.button("💾 Save Attendance"):
+        if st.button("💾 Save Final Attendance"):
             batch = []
             for _, r in edited.iterrows():
                 actual_id = df[df['Emp ID'] == r['Emp ID']]['id'].values[0]
                 batch.append({"staff_id": actual_id, "date": today, "status": "Present" if r['Attend'] else "Absent"})
             db.table("attendance").upsert(batch).execute()
-            st.success("Attendance Synced.")
+            st.success("Attendance Updated Successfully.")
 
 # --- PAGE 3: FINANCIALS & EXPORT ---
 elif page == "Financials & Export":
@@ -158,27 +171,24 @@ elif page == "Financials & Export":
                         all_advs.append({"Trans ID": a['id'], "Name": r['name'], "Amount": a['amount'], "Date": a['date']})
             
             if all_advs:
-                adv_df = pd.DataFrame(all_advs)
-                for _, trans in adv_df.iterrows():
+                for _, trans in pd.DataFrame(all_advs).iterrows():
                     tc1, tc2, tc3 = st.columns([3, 2, 1])
                     tc1.write(f"{trans['Name']} - ₹{trans['Amount']}")
                     tc2.write(f"Date: {trans['Date']}")
                     if tc3.button("🗑️", key=f"trans_{trans['Trans ID']}"):
                         db.table("advances").delete().eq("id", trans['Trans ID']).execute()
                         st.rerun()
-            else: st.write("No transactions found.")
 
         st.divider()
         if role == "Admin":
             st.subheader("Master Exports")
             col1, col2, col3 = st.columns(3)
-            # Added DOB to exports
-            col1.download_button("📥 HR CSV", df[['Emp ID','name','father_name','dob','aadhar_no']].to_csv(index=False), "HR_Report.csv")
+            col1.download_button("📥 HR CSV (with DOB)", df[['Emp ID','name','father_name','dob','aadhar_no']].to_csv(index=False), "HR_Report.csv")
             col2.download_button("📥 Finance CSV", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Report.csv")
             col3.download_button("📥 Full Master CSV", df.to_csv(index=False), "Full_Master_Report.csv")
         elif role == "HR":
-            st.download_button("📥 Export HR CSV", df[['Emp ID','name','father_name','dob','aadhar_no']].to_csv(index=False), "HR_Report.csv")
+            st.download_button("📥 HR CSV (with DOB)", df[['Emp ID','name','father_name','dob','aadhar_no']].to_csv(index=False), "HR_Report.csv")
         elif role == "Finance":
-            st.download_button("📥 Export Finance CSV", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Report.csv")
+            st.download_button("📥 Finance CSV", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Report.csv")
         
         st.dataframe(df, use_container_width=True, hide_index=True)
