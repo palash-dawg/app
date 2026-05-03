@@ -50,8 +50,11 @@ def upload_csv_to_drive(df):
         # Connect to the human-owned sheet
         sheet = client.open("KBP_FULL_SNAPSHOT").sheet1
         
+        # FIX: Remove 'department' column before exporting
+        export_df = df.drop(columns=['department']) if 'department' in df.columns else df
+        
         # FIX: Replace all empty cells (NaN) with blank strings so Google doesn't crash
-        safe_df = df.fillna("")
+        safe_df = export_df.fillna("")
         safe_df = safe_df.astype(str)
         
         data_list = [safe_df.columns.values.tolist()] + safe_df.values.tolist()
@@ -63,6 +66,7 @@ def upload_csv_to_drive(df):
         st.success("✅ Master Archive Synced to Google Drive Successfully!")
     except Exception as e:
         st.error(f"Google Drive Snapshot Failed: {e}")
+
 # --- 3. DATA ENGINE ---
 @st.cache_data(ttl=600)
 def get_master_data():
@@ -259,7 +263,7 @@ elif page == "Attendance Reports":
             
             st.dataframe(pd.DataFrame(summary_list), use_container_width=True)
 
-# --- PAGE: EXPORT CENTER (WITH GOOGLE DRIVE PUSH) ---
+# --- PAGE: EXPORT CENTER (WITH GOOGLE DRIVE PUSH & TRIAL CLEANUP) ---
 elif page == "Export Center":
     st.header("📥 Exports & Backups")
     df = get_master_data()
@@ -278,5 +282,17 @@ elif page == "Export Center":
             if st.button("🚀 Backup Full Master to Google Drive"):
                 with st.spinner("Pushing to Vault..."):
                     upload_csv_to_drive(df)
+            
+            st.divider()
+            st.subheader("🛠️ Developer Tools")
+            if st.button("🧹 Clean Up Trial Data"):
+                with st.spinner("Deleting trial records..."):
+                    try:
+                        db.table("staff_master").delete().ilike("name", "%(Trial)").execute()
+                        st.cache_data.clear()
+                        st.success("✅ All Trial Data Successfully Deleted!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error deleting data: {e}")
     else:
         st.warning("No data available to export.")
