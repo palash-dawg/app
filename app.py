@@ -34,6 +34,7 @@ def get_processed_data():
             presents = sum(1 for a in row['attendance'] if a['status'] == 'Present')
             halfs = sum(1 for a in row['attendance'] if a['status'] == 'Half-Day')
             advs = sum(adv['amount'] for adv in row['advances']) if isinstance(row['advances'], list) else 0
+            # Formula: (Present Days * Wage) + (Half Days * Wage/2) - Advances
             return (presents * row['daily_wage']) + (halfs * (row['daily_wage'] / 2)) - advs
         
         df['Net Payout'] = df.apply(calc_net, axis=1)
@@ -69,8 +70,10 @@ if page == "Worker Management":
             with st.form("reg_form", clear_on_submit=True):
                 c1, c2 = st.columns(2)
                 name, father = c1.text_input("Full Name*"), c2.text_input("Father's Name*")
-                aadhar, acc = c1.text_input("Aadhar Number*"), c2.text_input("Account No*")
-                wage = st.number_input("Daily Wage (₹)", value=500)
+                dob = c1.date_input("Date of Birth", min_value=datetime(1960, 1, 1), max_value=datetime.now())
+                aadhar = c2.text_input("Aadhar Number*")
+                acc = c1.text_input("Account No*")
+                wage = c2.number_input("Daily Wage (₹)", value=500)
                 photo = st.file_uploader("ID Photo", type=['jpg','png'])
 
                 if st.form_submit_button("Add Worker"):
@@ -83,24 +86,34 @@ if page == "Worker Management":
                             img = compress_worker_photo(photo)
                             path = f"ids/{aadhar}.jpg"; db.storage.from_("staff_files").upload(path, img, {"content-type": "image/jpeg"})
                             url = db.storage.from_("staff_files").get_public_url(path)
-                        db.table("staff_master").insert({"name": name, "father_name": father, "aadhar_no": aadhar, "account_no": acc, "daily_wage": wage, "photo_url": url, "department": role}).execute()
+                        
+                        db.table("staff_master").insert({
+                            "name": name, 
+                            "father_name": father, 
+                            "dob": str(dob), 
+                            "aadhar_no": aadhar, 
+                            "account_no": acc, 
+                            "daily_wage": wage, 
+                            "photo_url": url, 
+                            "department": role
+                        }).execute()
                         st.success("Worker Registered. IDs Shuffled."); st.rerun()
 
-    # --- DELETE EMPLOYEE SECTION ---
     st.subheader("📋 Worker Directory")
     df = get_processed_data()
     if not df.empty:
         for index, row in df.iterrows():
             c1, c2, c3 = st.columns([1, 4, 1])
             c1.write(f"**ID: {row['Emp ID']}**")
-            c2.write(f"{row['name']} | Aadhar: {row['aadhar_no']}")
+            # Added DOB to the display line
+            c2.write(f"{row['name']} | DOB: {row['dob']} | Aadhar: {row['aadhar_no']}")
             if role == "Admin":
                 if c3.button("🗑️ Delete", key=f"del_{row['id']}"):
                     db.table("staff_master").delete().eq("id", row['id']).execute()
                     st.toast(f"Deleted {row['name']}"); st.rerun()
     else: st.info("No workers registered.")
 
-# --- PAGE 2: ATTENDANCE (MARK ALL EXCEPT... & REDO) ---
+# --- PAGE 2: ATTENDANCE ---
 elif page == "Attendance Log":
     st.header("📅 Daily Attendance Log")
     df = get_processed_data()
@@ -108,11 +121,9 @@ elif page == "Attendance Log":
     
     if not df.empty:
         c1, c2, c3 = st.columns([1, 1, 1])
-        # Mark All Except Algorithm Logic
         if c1.button("✅ Mark All Present"): st.session_state.att_state = True
         if c2.button("❌ Mark All Absent"): st.session_state.att_state = False
         
-        # Redo Attendance Logic
         if c3.button("🔄 Redo Today (Clear Logs)"):
             db.table("attendance").delete().eq("date", today).execute()
             st.warning("Today's logs cleared. You can start over."); st.rerun()
@@ -121,7 +132,7 @@ elif page == "Attendance Log":
         
         df['Attend'] = st.session_state.att_state
         st.write("---")
-        st.info("💡 **Algorithm:** Click 'Mark All Present', then **untick** only the workers who are absent.")
+        st.info("💡 **Mark All Except Algorithm:** Click 'Mark All Present', then **untick** workers who are absent.")
         
         edited = st.data_editor(df[['Emp ID', 'name', 'Attend']], use_container_width=True, hide_index=True)
         
@@ -133,14 +144,13 @@ elif page == "Attendance Log":
             db.table("attendance").upsert(batch).execute()
             st.success("Attendance Synced.")
 
-# --- PAGE 3: FINANCIALS & EXPORT (DELETE TRANSACTIONS) ---
+# --- PAGE 3: FINANCIALS & EXPORT ---
 elif page == "Financials & Export":
     st.header("💰 Financial Center")
     df = get_processed_data()
     
     if not df.empty:
         with st.expander("💸 Delete Advances/Transactions"):
-            # Flatten transactions for a specific delete list
             all_advs = []
             for _, r in df.iterrows():
                 if isinstance(r['advances'], list):
@@ -159,15 +169,15 @@ elif page == "Financials & Export":
             else: st.write("No transactions found.")
 
         st.divider()
-        # Export Logic (Admin gets 3 options, others 1)
         if role == "Admin":
             st.subheader("Master Exports")
             col1, col2, col3 = st.columns(3)
-            col1.download_button("📥 HR CSV", df[['Emp ID','name','father_name','aadhar_no']].to_csv(index=False), "HR_Report.csv")
+            # Added DOB to exports
+            col1.download_button("📥 HR CSV", df[['Emp ID','name','father_name','dob','aadhar_no']].to_csv(index=False), "HR_Report.csv")
             col2.download_button("📥 Finance CSV", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Report.csv")
             col3.download_button("📥 Full Master CSV", df.to_csv(index=False), "Full_Master_Report.csv")
         elif role == "HR":
-            st.download_button("📥 Export HR CSV", df[['Emp ID','name','father_name','aadhar_no']].to_csv(index=False), "HR_Report.csv")
+            st.download_button("📥 Export HR CSV", df[['Emp ID','name','father_name','dob','aadhar_no']].to_csv(index=False), "HR_Report.csv")
         elif role == "Finance":
             st.download_button("📥 Export Finance CSV", df[['Emp ID','name','account_no','ifsc','Net Payout']].to_csv(index=False), "Finance_Report.csv")
         
